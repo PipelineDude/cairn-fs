@@ -1,0 +1,28 @@
+[package]
+name = "cairn-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cairn chunk storage: content-addressed local cache (cacache) with optional S3/GCS (opendal) fetch fallback, and the shared CloudOperator handle."
+license = "MIT"
+
+[dependencies]
+cacache = "13"
+leaky-bucket = "1.1.2"
+anyhow = "1.0"
+tracing = "0.1.44"
+opendal = { version = "0.58.1", features = ["services-s3", "services-gcs"], optional = true }
+reed-solomon-erasure = { version = "6.0.0", optional = true }
+futures = "0.3.32"
+blake3 = "1.8.5"
+tokio = { version = "1.52.3", features = ["rt"] }
+async-trait = "0.1"
+
+[features]
+cloud-storage = ["dep:opendal", "dep:reed-solomon-erasure"]
+
+[dev-dependencies]
+tempfile = "3.17"
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }
+age = "0.11.3"
+

@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = ["crates/cairn-seal", "crates/cairn-index", "crates/cairn-cdc", "crates/cairn-store", "crates/cairn-keys", "crates/cairn-core", "crates/cairn-fuse"]
+
+[package]
+name = "cairn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cairn — encrypted, deduplicated, content-addressed backup filesystem (FUSE) with asymmetric (public/private-key) envelope encryption. CLI front-end composing the cairn-* engine crates."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/example/cairn"
+keywords = ["fuse", "backup", "encryption", "deduplication", "filesystem"]
+categories = ["filesystem", "cryptography"]
+
+[dependencies]
+# The CLI's own direct deps only; each engine crate declares its own.
+tokio = { version = "1.32", features = ["full", "macros", "rt-multi-thread"] }
+cacache = "13"
+leaky-bucket = "1.1.2"
+clap = { version = "4.4", features = ["derive", "env"] }
+anyhow = "1.0"
+zeroize = "1.7"
+lru = "0.18"
+url = "2.5"
+opendal = { version = "0.58.1", features = ["services-s3", "services-gcs", "services-azblob", "services-ftp", "services-webdav", "services-dropbox", "services-gdrive", "services-fs"], optional = true }
+secrecy = "0.10.3"
+dashmap = "5.5.3"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+futures = "0.3"
+cairn-seal = { path = "crates/cairn-seal" }
+cairn-index = { path = "crates/cairn-index" }
+cairn-cdc = { path = "crates/cairn-cdc" }
+cairn-store = { path = "crates/cairn-store" }
+cairn-core = { path = "crates/cairn-core" }
+cairn-fuse = { path = "crates/cairn-fuse" }
+reed-solomon-erasure = "6.0.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+chrono = "0.4"
+walkdir = "2.5.0"
+glob = "0.3.1"
+rand = "0.8"
+hex = "0.4"
+libc = "0.2.186"
+indicatif = "0.17"
+blake3 = "1.8.5"
+tempfile = "3.10"
+
+[[bench]]
+name = "cairn_bench"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+# Crates the benchmarks exercise directly (chunking + compression):
+fastcdc = "3.1"
+lz4_flex = "0.13.1"
+zstd = "0.13"
+mockall = "0.12"
+tokio-test = "0.4"
+# Integration tests generate age keypairs directly (matches cairn-seal's 0.11.x pin).
+age = "0.11"
+# Property round-trip: random trees through init→backup→extract.
+proptest = "1"
+
+[features]
+# `cloud-storage` pulls in the S3/GCS backend stack (opendal + HTTP/TLS). Building
+# with `--no-default-features` yields an offline (local-disk-only) binary with no
+# network client at all.
+default = ["cloud-storage"]
+cloud-storage = ["dep:opendal", "cairn-store/cloud-storage", "cairn-cdc/cloud-storage", "cairn-core/cloud-storage", "cairn-fuse/cloud-storage"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+
+

@@ -1,0 +1,49 @@
+[graph]
+no-default-features = true
+
+[advisories]
+ignore = [
+    # Transitive deps we can't control — no safe upgrade available
+    { id = "RUSTSEC-2025-0052", reason = "async-std: transitive dep of cacache, discontinued" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode: transitive dep of fuse3, unmaintained" },
+    { id = "RUSTSEC-2024-0384", reason = "instant: transitive dep of reed-solomon-erasure/parking_lot, unmaintained" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix: transitive dep of indicatif, unmaintained" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: transitive dep of i18n-embed-fl, unmaintained" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "BSL-1.0",
+    "0BSD",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

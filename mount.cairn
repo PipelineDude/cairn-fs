@@ -1,0 +1,70 @@
+#!/bin/bash
+# /sbin/mount.cairn — mount(8) wrapper for cairn.
+#
+# Reads the mount(8) `-o` options, translates the stable ones to cairn flags, and
+# execs cairn in the foreground (the mount command blocks until unmount, per the
+# mount(8) convention — see `man 8 mount`).
+
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+    echo "usage: mount.cairn <archive.db> <mountpoint> [-o <opts>]" >&2
+    exit 2
+fi
+
+ARCHIVE="$1"
+MOUNTPOINT="$2"
+shift 2
+
+# Path to the cairn binary. Override via $CAIRN_BIN if installed elsewhere.
+CAIRN_BIN="${CAIRN_BIN:-cairn}"
+
+ARGS=(mount "$ARCHIVE" "$MOUNTPOINT")
+
+while getopts "o:" opt; do
+    case ${opt} in
+        o )
+            IFS=',' read -ra OPTS <<< "$OPTARG"
+            for O in "${OPTS[@]}"; do
+                case $O in
+                    # Never accept a password on the command line — it is visible in `ps`.
+                    password=*)
+                        echo "mount.cairn: do NOT pass the password on the command line" >&2
+                        echo "  use the CAIRN_PASSWORD env var or --password-file <path>." >&2
+                        exit 2
+                        ;;
+                    ro|read-only)
+                        ARGS+=(--read-only)
+                        ;;
+                    allow_other)
+                        ARGS+=(--allow-other)
+                        ;;
+                    # Forward FUSE kernel options as-is.
+                    suid|noexec|nosuid|nodev|dev|exec)
+                        ARGS+=(-o "$O")
+                        ;;
+                    *)
+                        # Pass anything else through so kernel-side FUSE options
+                        # (max_read=, default_permissions) still work.
+                        ARGS+=(-o "$O")
+                        ;;
+                esac
+            done
+            ;;
+        \?)
+            exit 2
+            ;;
+    esac
+done
+
+if [[ ! -d "$MOUNTPOINT" ]]; then
+    echo "mount.cairn: mountpoint $MOUNTPOINT does not exist" >&2
+    exit 2
+fi
+if [[ ! -f "$ARCHIVE" ]]; then
+    echo "mount.cairn: archive $ARCHIVE does not exist (run 'cairn $ARCHIVE init' first)" >&2
+    exit 2
+fi
+
+# The cairn mount command blocks until unmount; that's the mount(8) contract.
+exec "$CAIRN_BIN" "${ARGS[@]}"

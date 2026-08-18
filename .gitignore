@@ -1,0 +1,28 @@
+/target
+# User keys (never commit private keys!)
+*.pem
+*.bak
+!cairn_pub.pem
+!cairn_pub.pem.example
+
+# Secrets and sensitive test data
+*.bin
+secret.txt
+recovered.txt
+
+# Scratch scripts and temp files
+*.py
+fix_*.py
+diff*.txt
+*.log
+
+# FUSE mount test artifacts
+mnt/
+fuse.log
+graphify-out/
+
+# stray test archive DBs accidentally created in repo root
+/*.db
+/*.db-shm
+/*.db-wal
+/*.db.lock

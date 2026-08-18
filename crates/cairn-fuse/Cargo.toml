@@ -1,0 +1,28 @@
+[package]
+name = "cairn-fuse"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cairn fuse3 adapter: a thin wrapper that implements fuse3::Filesystem by forwarding every operation to the cairn-core engine. All logic lives in cairn-core; this crate is only the engine<->fuse3 seam."
+license = "MIT"
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+futures = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
+libc = "0.2"
+
+[features]
+cloud-storage = ["cairn-core/cloud-storage"]
+
+[dev-dependencies]
+cairn-index = { path = "../cairn-index" }
+cairn-store = { path = "../cairn-store" }
+cairn-seal = { path = "../cairn-seal" }
+tokio = { version = "1.0", features = ["full"] }
+tempfile = "3.10"
+dashmap = "5.5"
+lru = "0.18"
+secrecy = "0.10.3"

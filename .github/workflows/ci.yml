@@ -1,0 +1,77 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libfuse3-dev fuse3 sqlcipher libssl-dev pkg-config clang
+
+    - name: Check formatting
+      run: cargo fmt --check
+
+    # Both feature configs are exercised: bugs hide in whichever one CI skips.
+    # The default (cloud-storage) config and the offline (--no-default-features)
+    # config compile different code — a real compile error has slipped through a
+    # CI that only tested one. `--all-targets` also covers tests and benches.
+    - name: Clippy (default / cloud-storage)
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    - name: Clippy (offline)
+      run: cargo clippy --no-default-features --workspace --all-targets -- -D warnings
+
+    - name: Build (both configs)
+      run: |
+        cargo build --workspace
+        cargo build --no-default-features --workspace
+
+    - name: Cargo audit
+      run: |
+        cargo install cargo-audit
+        cargo audit
+
+    - name: Cargo deny
+      run: |
+        cargo install cargo-deny --locked
+        cargo deny check advisories licenses bans sources
+
+    - name: Unit tests (both configs)
+      run: |
+        cargo test --workspace
+        cargo test --no-default-features --workspace
+
+    - name: E2E smoke test
+      run: |
+        cargo build --release --workspace
+        ./tests/e2e_smoke.sh target/release/cairn
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libfuse3-dev fuse3 sqlcipher libssl-dev pkg-config clang
+
+    - name: Install cargo-llvm-cov
+      run: |
+        rustup component add llvm-tools-preview
+        cargo install cargo-llvm-cov
+
+    - name: Coverage gate
+      run: tests/coverage.sh --ci

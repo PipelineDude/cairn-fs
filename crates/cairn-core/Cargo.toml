@@ -1,0 +1,44 @@
+[package]
+name = "cairn-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cairn filesystem engine: the CairnEngine struct + all operations (read/write/RMW/flush, lookup/getattr, gc/scrub/snapshots, extract) as inherent methods returning fuse3 types. The thin fuse3 Filesystem adapter is the sibling cairn-fuse crate."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.32", features = ["full"] }
+futures = "0.3"
+libc = "0.2"
+cacache = "13"
+zeroize = "1.7"
+lru = "0.18"
+dashmap = "5.5.3"
+blake3 = "1.8.5"
+anyhow = "1.0"
+tracing = "0.1.44"
+chacha20 = "0.10.1"
+secrecy = "0.10.3"
+parking_lot = "0.12"
+cairn-seal = { path = "../cairn-seal" }
+cairn-index = { path = "../cairn-index" }
+cairn-cdc = { path = "../cairn-cdc" }
+cairn-store = { path = "../cairn-store" }
+opendal = { version = "0.58.1", features = ["services-s3", "services-gcs"], optional = true }
+glob = "0.3.3"
+fastcdc = "3.1.0"
+tempfile = "3.10"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+hex = "0.4"
+
+[features]
+# opendal for the cross-node lock ops; must match the shared CloudOperator type, so it
+# pulls cairn-store's (CloudOperator home) and cairn-cdc's features too.
+cloud-storage = ["dep:opendal", "cairn-store/cloud-storage", "cairn-cdc/cloud-storage"]
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { version = "1.32", features = ["full", "test-util", "macros"] }
+age = "0.11"
+proptest = "1"

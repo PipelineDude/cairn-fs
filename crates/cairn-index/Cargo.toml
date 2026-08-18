@@ -1,0 +1,20 @@
+[package]
+name = "cairn-index"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cairn metadata index: SQLCipher-backed store of inodes, dentries, chunk map, xattrs and snapshots (r2d2 pool)."
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher", "blob"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.24.0"
+secrecy = "0.10.3"
+anyhow = "1.0"
+tracing = "0.1.44"
+libc = "0.2"
+tempfile = "3.27.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

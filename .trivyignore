@@ -1,0 +1,7 @@
+# Accepted-known findings baseline (F-9 scanner gate).
+# Anything NOT listed here fails tests/e2e_smoke.sh loudly.
+
+# Dockerfile runs as root: the image is `scratch`-based with a single static
+# binary and is documented as such (README "Docker"). Accepted until a
+# non-root USER is added to the Dockerfile.
+DS-0002
