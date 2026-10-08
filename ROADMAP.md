@@ -11,7 +11,7 @@ data path, with two things that set it apart from restic/borg/kopia:
 
 ## Near-term (backup core hardening)
 - **Restore/read performance.** Asymmetric unwrap (age X25519) runs per chunk on read. Keep the session key-cache warm,
-  parallelize chunk fetch+decrypt on `extract`, and benchmark a large restore end-to-end.
+  parallelize chunk fetch+decrypt on `extract` (A-4), and benchmark a large restore end-to-end.
 - ~~**Verify/repair.** Extend `scrub` into a real `verify` (per-chunk integrity + report) and a `repair` that re-fetches
   corrupt chunks from another storage backend.~~ (Completed)
 - ~~**Symmetric mode (optional).** Offer a password-only (symmetric) mode for users who don't want key management, while

@@ -668,10 +668,9 @@ fn test_decrypt_blob_zeroizing_and_error_redaction() {
     );
 }
 
-/// a dedup_secret shorter than 32 bytes panics. The default init
-/// generates 64-hex-char (32-byte) secrets, so this only bites a custom
-/// user-provided value.
-/// generate_chunk_key now returns Result instead of panicking.
+/// a dedup_secret shorter than 32 bytes must fail cleanly when deriving
+/// a content ID. The default init generates a 64-hex-char (32-byte) secret,
+/// so this only bites a custom user-provided value.
 #[test]
 fn test_short_dedup_secret_returns_error() {
     use cairn_seal::CryptoCtx;
@@ -695,7 +694,7 @@ fn test_short_dedup_secret_returns_error() {
         1024,
     )
     .unwrap()
-    .generate_chunk_key(b"x");
+    .content_id(b"x");
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(err_msg.contains("dedup_secret must be at least 32 bytes"));

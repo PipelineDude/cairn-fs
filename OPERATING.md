@@ -28,11 +28,10 @@ export CAIRN_PASSWORD='a-strong-index-password'   # avoids passing --password in
 For a single-machine pilot with no key management, symmetric mode is fine (one password unlocks
 everything — no write-only property): just omit `--pub-key` everywhere.
 
-**File names** are hidden from the backup host by default on an asymmetric `init` with a
-password (`cairn backup.db init --pub-key pub.pem`; no flag needed). Fixed at init; names then
-need the **private key** to read (the password alone no longer shows the real tree — a
-deliberate DR trade-off). Pass `--plaintext-names` to opt out and keep names visible to the
-password holder. Sizes, tree shape, timestamps and xattr values stay visible either way. Details + threat
+To also hide **file names** from the backup host, add `--hide-names` to the asymmetric `init`
+(`cairn backup.db init --pub-key pub.pem --hide-names`). Fixed at init; names then need the
+**private key** to read (the password alone no longer shows the real tree — a deliberate DR
+trade-off). Sizes, tree shape, timestamps and xattr values stay visible. Details + threat
 boundary: `HIDE_NAMES.md`.
 
 ## 2. Back up
@@ -173,7 +172,7 @@ without the master key — that is the ransomware protection; run it from a trus
   non-atomic window is documented in ARCHITECTURE.
 - Kill-9 / power loss loses at most the last un-`fsync`'d write, never a corrupt file
   (`ARCHITECTURE.md` → *Crash & failure consistency*). An interrupted `backup` resumes on re-run;
-  incomplete mid-file is flagged by `verify`.
+  incomplete mid-file is flagged by `verify` (F-19).
 - **Index is SPOF:** **copy** the `.db` (and password custody) separately from chunks —
   `backup --index-backup DIR`, `index-backup DIR`, or `CAIRN_INDEX_BACKUP`. Losing the index or
   password makes chunks unusable; **do not** try to rebuild the tree from ciphertext chunks.

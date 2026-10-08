@@ -2,16 +2,10 @@
 // the trait's argument shapes verbatim, so several exceed clippy's 7-arg threshold.
 #![allow(clippy::too_many_arguments)]
 
-pub mod maintenance;
-pub mod manifest;
-pub mod metrics;
-pub mod restore;
+pub mod hashing;
+pub mod shared_reader;
 pub mod types;
 pub mod vfs;
-#[cfg(feature = "cloud-storage")]
-pub use crate::manifest::restore_index_from_cloud;
-pub use crate::manifest::{Manifest, ManifestChunk};
-pub use crate::metrics::{BackupStats, BackupStatsDelta, BackupStatsSnapshot, human_bytes};
 use crate::types::{
     DirectoryEntry, DirectoryEntryPlus, EngineReplyEntry, FileAttr, FileType, Request, SetAttr,
     mode_to_filetype,
@@ -78,6 +72,150 @@ pub const DEFAULT_MAX_WRITE_NZ: std::num::NonZeroU32 =
         Some(n) => n,
         None => panic!("DEFAULT_MAX_WRITE must be non-zero"),
     };
+
+/// Per-operation backup statistics, tracked via atomics on `CairnEngine`.
+/// The backup handler snapshots counters before/after to compute deltas.
+pub struct BackupStats {
+    pub dedup_hits: std::sync::atomic::AtomicUsize,
+    pub new_chunks: std::sync::atomic::AtomicUsize,
+    pub bytes_deduped: std::sync::atomic::AtomicUsize,
+    pub bytes_written: std::sync::atomic::AtomicUsize,
+    pub files_processed: std::sync::atomic::AtomicUsize,
+    pub files_skipped: std::sync::atomic::AtomicUsize,
+}
+
+impl BackupStats {
+    pub fn new() -> Self {
+        Self {
+            dedup_hits: std::sync::atomic::AtomicUsize::new(0),
+            new_chunks: std::sync::atomic::AtomicUsize::new(0),
+            bytes_deduped: std::sync::atomic::AtomicUsize::new(0),
+            bytes_written: std::sync::atomic::AtomicUsize::new(0),
+            files_processed: std::sync::atomic::AtomicUsize::new(0),
+            files_skipped: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> BackupStatsSnapshot {
+        BackupStatsSnapshot {
+            dedup_hits: self.dedup_hits.load(std::sync::atomic::Ordering::Relaxed),
+            new_chunks: self.new_chunks.load(std::sync::atomic::Ordering::Relaxed),
+            bytes_deduped: self
+                .bytes_deduped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            bytes_written: self
+                .bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            files_processed: self
+                .files_processed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            files_skipped: self
+                .files_skipped
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.dedup_hits
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.new_chunks
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_deduped
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_written
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.files_processed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.files_skipped
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Default for BackupStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BackupStatsSnapshot {
+    pub dedup_hits: usize,
+    pub new_chunks: usize,
+    pub bytes_deduped: usize,
+    pub bytes_written: usize,
+    pub files_processed: usize,
+    pub files_skipped: usize,
+}
+
+impl BackupStatsSnapshot {
+    pub fn delta(&self, before: &BackupStatsSnapshot) -> BackupStatsDelta {
+        BackupStatsDelta {
+            dedup_hits: self.dedup_hits.saturating_sub(before.dedup_hits),
+            new_chunks: self.new_chunks.saturating_sub(before.new_chunks),
+            bytes_deduped: self.bytes_deduped.saturating_sub(before.bytes_deduped),
+            bytes_written: self.bytes_written.saturating_sub(before.bytes_written),
+            files_processed: self.files_processed.saturating_sub(before.files_processed),
+            files_skipped: self.files_skipped.saturating_sub(before.files_skipped),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BackupStatsDelta {
+    pub dedup_hits: usize,
+    pub new_chunks: usize,
+    pub bytes_deduped: usize,
+    pub bytes_written: usize,
+    pub files_processed: usize,
+    pub files_skipped: usize,
+}
+
+impl std::fmt::Display for BackupStatsDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total_chunks = self.dedup_hits + self.new_chunks;
+        let dedup_ratio = if total_chunks > 0 {
+            self.dedup_hits as f64 / total_chunks as f64 * 100.0
+        } else {
+            0.0
+        };
+        let comp_ratio = if self.bytes_written > 0 && self.bytes_deduped > 0 {
+            self.bytes_deduped as f64 / self.bytes_written as f64
+        } else {
+            0.0
+        };
+        write!(
+            f,
+            "files: {} processed, {} skipped | chunks: {} new, {} deduped ({:.1}%) | \
+             bytes: {} written, {} deduped",
+            self.files_processed,
+            self.files_skipped,
+            self.new_chunks,
+            self.dedup_hits,
+            dedup_ratio,
+            human_bytes(self.bytes_written),
+            human_bytes(self.bytes_deduped),
+        )?;
+        if comp_ratio > 1.0 {
+            write!(f, " | compression: {:.1}x", comp_ratio)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn human_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    const GB: usize = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GiB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MiB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KiB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
 #[derive(Clone)]
 pub struct CairnEngine {
@@ -207,64 +345,324 @@ pub(crate) fn mk_file_attr(
     }
 }
 
-/// Outcome of resolving a stored dentry to a display/on-disk name. Callers
-/// that only display the name (readdir) can discard the distinction, but
-/// callers that write real files (extract) must be able to tell a decrypted
-/// real name from the opaque-hash fallback, so they can warn instead of
-/// silently writing hash-named files to disk.
-pub(crate) enum ResolvedName {
-    Real(String),
-    Opaque(String),
+/// H13: read-only replica audit over all operators.  `verified` are safe to
+/// skip in a resumable copy; `missing`/`corrupt` need re-copy (only READ
+/// verification counts — inventory-implied presence is not proof).
+#[derive(Default)]
+
+/// H13b: outcome of a resumable read-write repair pass.
+#[cfg(feature = "cloud-storage")]
+#[derive(Debug)]
+pub struct ReplicateReport {
+    pub repaired: usize,
+    pub verified_skipped: usize,
+    pub unrepaired: Vec<(String, usize)>,
 }
 
-impl ResolvedName {
-    pub(crate) fn as_str(&self) -> &str {
-        match self {
-            ResolvedName::Real(s) | ResolvedName::Opaque(s) => s,
-        }
-    }
+/// H13: read-only replica audit over all operators.
+#[cfg(feature = "cloud-storage")]
+pub struct ReplicaAudit {
+    pub verified: Vec<(String, usize)>,
+    pub missing: Vec<(String, usize)>,
+    pub corrupt: Vec<(String, usize)>,
+}
 
-    pub(crate) fn into_string(self) -> String {
-        match self {
-            ResolvedName::Real(s) | ResolvedName::Opaque(s) => s,
-        }
-    }
+/// H14: deduplication statistics for the archive.
+#[derive(Debug)]
+pub struct DedupStats {
+    pub logical_file_bytes: u64,
+    pub inline_logical_bytes: u64,
+    pub unique_object_count: usize,
+    pub unique_object_bytes: u64,
+    pub compressed_stored_bytes: u64,
+    pub orphaned_objects: u64,
+    pub savings_percent: f64,
+}
 
-    pub(crate) fn is_opaque(&self) -> bool {
-        matches!(self, ResolvedName::Opaque(_))
+/// H09: aggregate result of verifying every regular file's stored digest
+/// (used by restore/scrub checks; `failed` entries break the "success" answer).
+#[derive(Debug, Default)]
+
+pub struct VerifyAllReport {
+    pub verified: usize,
+    pub missing_digest: usize,
+    pub failed: Vec<(u64, String)>,
+    /// H11: how many files were re-verified after they appeared unchanged.
+    pub changed_during_read: usize,
+    /// H11: total logical bytes checked across all files.
+    pub bytes_read: u64,
+}
+
+/// H11: outcome of a per-file content stability check.  A stable file may
+/// still fail its digest (Unverified); a file that changed concurrently while
+/// we were hashing is reported separately.
+pub enum VerifyOutcome {
+    Verified { bytes_read: u64 },
+    Unverified(String),
+    ChangedDuringRead { bytes_read: u64 },
+}
+
+#[allow(dead_code)]
+pub fn bytes_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotBundleManifest {
+    version: u8,
+    snapshot_id: u64,
+    objects: Vec<String>,
+    /// BF-04.4: blake3 hex of the `snapshot.db` bytes. Empty only in bundles
+    /// exported before this field existed; import refuses those loudly.
+    #[serde(default)]
+    db_hash: String,
+}
+
+/// BF-04.9: exclusive advisory lock around a checkpoint file's
+/// read-check-write. The checkpoint itself is replaced atomically (temp +
+/// rename), so an flock on it cannot be held across the replace; the lock
+/// therefore lives in a stable `<path>.lock` sidecar.
+struct CheckpointLock {
+    file: std::fs::File,
+}
+
+impl CheckpointLock {
+    #[allow(unsafe_code)]
+    fn acquire(path: &std::path::Path) -> anyhow::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let mut lock_name = path.as_os_str().to_owned();
+        lock_name.push(".lock");
+        let lock_path = std::path::PathBuf::from(lock_name);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        // SAFETY: flock(2) on a valid fd; LOCK_EX blocks until the lock is
+        // free, so concurrent recorders serialize here.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            anyhow::bail!(
+                "cannot lock checkpoint {}: {}",
+                lock_path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(Self { file })
     }
 }
 
-/// Free-function core of `CairnEngine::resolve_dentry_name`, taking `crypto`
-/// directly so it can run inside a `spawn_blocking` closure that only clones
-/// the `Arc<CryptoCtx>` (not the whole engine) — see readdir/readdirplus.
-pub(crate) fn resolve_name(
-    crypto: &cairn_seal::CryptoCtx,
-    lookup_key: &str,
-    name_enc: Option<&[u8]>,
-) -> ResolvedName {
-    if !crypto.hide_names {
-        return ResolvedName::Real(lookup_key.to_string());
-    }
-    match name_enc {
-        Some(blob) => match crypto.decrypt_name_cached(blob) {
-            Ok(name) => ResolvedName::Real(name),
-            Err(e) => {
-                if crypto.has_private_key() {
-                    tracing::error!(
-                        "hide-names: failed to decrypt name for dentry {lookup_key} \
-                         despite having the private key — the name_enc blob is corrupt; \
-                         falling back to the opaque hash: {e}"
-                    );
-                }
-                ResolvedName::Opaque(lookup_key.to_string())
-            }
-        },
-        None => ResolvedName::Opaque(lookup_key.to_string()),
+impl Drop for CheckpointLock {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: releasing our own lock on a valid fd; drop cannot report.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
 impl CairnEngine {
+    /// Export one frozen snapshot and every ciphertext object it references.
+    /// The bundle is opaque: no archive key or plaintext is required to copy it.
+    pub async fn export_snapshot_bundle(
+        &self,
+        snap_id: u64,
+        destination: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        if destination.exists() {
+            anyhow::bail!("bundle destination already exists: {destination:?}");
+        }
+        let parent = destination.parent().unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let temp = tempfile::Builder::new()
+            .prefix(".cairn-export-")
+            .tempdir_in(parent)?;
+        let db_path = temp.path().join("snapshot.db");
+        let ids = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.snapshot_used_objects(snap_id))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        self.db.extract_snapshot(
+            snap_id,
+            db_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF8 bundle path"))?,
+        )?;
+        let objects_dir = temp.path().join("chunks");
+        std::fs::create_dir(&objects_dir)?;
+        let mut objects: Vec<String> = ids.into_iter().collect();
+        objects.sort();
+        for id in &objects {
+            if !Self::bundle_object_id_valid(id) {
+                anyhow::bail!("invalid object id in snapshot");
+            }
+            let bytes = self.fetch_chunk(id).await?;
+            if !crate::hashing::replica_matches(id, &bytes) {
+                anyhow::bail!("cannot export corrupt object {id}");
+            }
+            std::fs::write(objects_dir.join(id), &bytes)?;
+        }
+        let manifest = SnapshotBundleManifest {
+            version: 1,
+            snapshot_id: snap_id,
+            objects,
+            db_hash: blake3::hash(&std::fs::read(&db_path)?).to_hex().to_string(),
+        };
+        std::fs::write(
+            temp.path().join("manifest.json"),
+            serde_json::to_vec(&manifest)?,
+        )?;
+        let temp_path = temp.keep();
+        std::fs::rename(&temp_path, destination)
+            .map_err(|e| anyhow::anyhow!("publish bundle failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Validate an opaque bundle then import its objects into a local cache.
+    /// No existing cache entry is trusted or overwritten before validation.
+    ///
+    /// BF-04.4 hardening: the manifest must carry a matching blake3 of
+    /// `snapshot.db` (otherwise a substitute DB would be imported), ids must be
+    /// unique, and each object is read from disk exactly ONCE — the verified
+    /// bytes are what gets written to the cache, so a file swapped between
+    /// validation and publication cannot slip unverified bytes in (TOCTOU).
+    pub async fn import_snapshot_bundle(
+        bundle: &std::path::Path,
+        cache_dir: &std::path::Path,
+    ) -> anyhow::Result<u64> {
+        let manifest: SnapshotBundleManifest =
+            serde_json::from_slice(&std::fs::read(bundle.join("manifest.json"))?)?;
+        if manifest.version != 1 || !bundle.join("snapshot.db").is_file() {
+            anyhow::bail!("invalid snapshot bundle");
+        }
+        if manifest.db_hash.is_empty() {
+            anyhow::bail!(
+                "bundle manifest has no snapshot.db hash (exported by an older version); \
+                 re-export the bundle"
+            );
+        }
+        let db_bytes = std::fs::read(bundle.join("snapshot.db"))?;
+        if blake3::hash(&db_bytes).to_hex().as_str() != manifest.db_hash {
+            anyhow::bail!("bundle snapshot.db hash mismatch");
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut verified: Vec<(String, Vec<u8>)> = Vec::with_capacity(manifest.objects.len());
+        for id in &manifest.objects {
+            if !Self::bundle_object_id_valid(id) {
+                anyhow::bail!("invalid object id in bundle");
+            }
+            if !seen.insert(id.clone()) {
+                anyhow::bail!("duplicate object id in bundle manifest");
+            }
+            let bytes = std::fs::read(bundle.join("chunks").join(id))?;
+            if !crate::hashing::replica_matches(id, &bytes) {
+                anyhow::bail!("bundle object hash mismatch");
+            }
+            verified.push((id.clone(), bytes));
+        }
+
+        std::fs::create_dir_all(cache_dir)?;
+        for (id, bytes) in verified {
+            cacache::write(cache_dir, &id, bytes).await?;
+        }
+        Ok(manifest.snapshot_id)
+    }
+
+    fn bundle_object_id_valid(id: &str) -> bool {
+        id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    /// D03: shared-domain-aware chunk decrypt. When a domain key is configured
+    /// (CAIRN_SHARED_DEDUP_SECRET) and the chunk is flagged `domain` in the
+    /// index, decrypt via the domain path; otherwise fall back to the normal
+    /// archive-scope `decrypt_chunk_symmetric`.
+    fn decrypt_chunk_auto(
+        &self,
+        object_id: &str,
+        ciphertext: &[u8],
+        wrapped_key: &[u8],
+        comp_type: u8,
+        cipher_algo: &str,
+    ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+        let reader = shared_reader::SharedChunkReader::from_archive_config(self.db.clone())?;
+        if reader.domain_mode_active() {
+            if let Some(pt) = reader.try_decrypt_domain(
+                &self.crypto,
+                object_id,
+                ciphertext,
+                wrapped_key,
+                comp_type,
+                cipher_algo,
+            )? {
+                return Ok(pt);
+            }
+        }
+        self.crypto.decrypt_sealed_chunk(ciphertext, wrapped_key)
+    }
+
+    /// Build the shared-dedup write config from the archive-pinned domain
+    /// store and secret-file path.  A configured shared archive must fail
+    /// loudly when either resource is unavailable; silently falling back to
+    /// archive-scoped writes breaks cross-archive deduplication.
+    fn shared_dedup_write_config(
+        &self,
+    ) -> anyhow::Result<Option<cairn_cdc::shared::SharedDedupConfig>> {
+        let Some(domain_id) = self.db.get_config("dedup_shared_domain")? else {
+            return Ok(None);
+        };
+        let store_dir = self
+            .db
+            .get_config("dedup_shared_store_dir")?
+            .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no shared store directory"))?;
+        let secret_path = self.db.get_config("dedup_shared_secret_file")?;
+        let expected = self
+            .db
+            .get_config("dedup_shared_namespace")?
+            .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no persisted namespace"))?;
+        // BF-04.10(b): the documented background path — CAIRN_SHARED_DEDUP_SECRET
+        // in the environment — is now actually consulted by the engine and
+        // validated against the archive's persisted namespace. The env secret
+        // wins when set; a mismatch is an error, never a silent fallback.
+        let secret = match std::env::var("CAIRN_SHARED_DEDUP_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            Some(env_secret) => {
+                let bytes = env_secret.into_bytes();
+                if cairn_store::shared_dedup::derive_namespace(&domain_id, &bytes) != expected {
+                    anyhow::bail!(
+                        "CAIRN_SHARED_DEDUP_SECRET does not match this archive's configured domain"
+                    );
+                }
+                bytes
+            }
+            None => {
+                let secret_path = secret_path.ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no secret source: set CAIRN_SHARED_DEDUP_SECRET (background) or configure a secret file at init"))?;
+                let secret = std::fs::read(&secret_path).map_err(|e| {
+                    anyhow::anyhow!("cannot read shared-dedup secret file {secret_path}: {e}")
+                })?;
+                if secret.is_empty() {
+                    anyhow::bail!("shared-dedup secret file {secret_path} is empty");
+                }
+                secret
+            }
+        };
+        if cairn_store::shared_dedup::derive_namespace(&domain_id, &secret) != expected {
+            anyhow::bail!("shared-dedup secret does not match this archive's configured domain");
+        }
+        Ok(Some(cairn_cdc::shared::SharedDedupConfig {
+            records_dir: store_dir,
+            domain_id,
+            domain_secret: secret,
+        }))
+    }
+
     /// Convert any error into an `io::Error(EIO)` while logging it.
     pub(crate) fn to_eio(e: impl std::fmt::Display) -> std::io::Error {
         tracing::error!("EIO: {e}");
@@ -378,31 +776,56 @@ impl CairnEngine {
     /// RMW path from runaway allocation when the surrounding chunks are huge.
     const MAX_MERGE_RMW: u32 = 64;
 
-    /// Envelope-wrap inline (small-file) data before it is stored in
-    /// `inodes.inline_data`, so a small file gets the SAME protection as a
-    /// chunked one. Previously inline data sat as PLAINTEXT inside the SQLCipher
-    /// DB — anyone with the DB password could read it even on an asymmetric
-    /// (write-only) archive without the private key, breaking the write-only
-    /// guarantee for every file <= the inline threshold (and symlink targets).
-    /// Reuses the chunk-key envelope: age-wrapped in asymmetric mode (only the
-    /// private key reads), KEK-wrapped in symmetric mode (the password reads).
+    /// Inline container: `CIN01 || BE32(wrapped record length) || wrapped record
+    /// || ciphertext`. The sealed record authenticates the DEK, algorithm,
+    /// compression, plaintext length, ciphertext length and ciphertext hash.
+    const INLINE_SEALED_MAGIC: &'static [u8; 5] = b"CIN01";
+
+    /// Seal inline (small-file) data before storing it in `inodes.inline_data`.
     /// Empty stays empty (`set_inline_data` treats an empty slice as NULL).
     pub fn wrap_inline(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
         if plaintext.is_empty() {
             return Ok(Vec::new());
         }
-        self.crypto.encrypt_blob(plaintext)
+        let sealed = self.crypto.seal_chunk(plaintext, Some("none"))?;
+        let wrapped_len = u32::try_from(sealed.wrapped_key.len())
+            .map_err(|_| anyhow::anyhow!("sealed inline record is too large"))?;
+        let mut stored = Vec::with_capacity(
+            Self::INLINE_SEALED_MAGIC.len()
+                + 4
+                + sealed.wrapped_key.len()
+                + sealed.ciphertext.len(),
+        );
+        stored.extend_from_slice(Self::INLINE_SEALED_MAGIC);
+        stored.extend_from_slice(&wrapped_len.to_be_bytes());
+        stored.extend_from_slice(&sealed.wrapped_key);
+        stored.extend_from_slice(&sealed.ciphertext);
+        Ok(stored)
     }
 
-    /// Inverse of [`Self::wrap_inline`]: decrypt inline data read back from
-    /// `inodes.inline_data`. In asymmetric mode this REQUIRES the private key,
-    /// so a public-key-only host cannot read inline content — exactly the
-    /// write-only property. Returns zeroizing plaintext.
+    /// Inverse of [`Self::wrap_inline`]. No caller-supplied cipher or compression
+    /// metadata is trusted: it comes only from the encrypted CSK02 record.
     pub fn unwrap_inline(&self, stored: &[u8]) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
         if stored.is_empty() {
             return Ok(zeroize::Zeroizing::new(Vec::new()));
         }
-        self.crypto.decrypt_blob(stored)
+        let header_len = Self::INLINE_SEALED_MAGIC.len() + 4;
+        if stored.len() < header_len || !stored.starts_with(Self::INLINE_SEALED_MAGIC) {
+            anyhow::bail!("inline data is not a sealed CIN01 container");
+        }
+        let wrapped_len = u32::from_be_bytes(
+            stored[Self::INLINE_SEALED_MAGIC.len()..header_len]
+                .try_into()
+                .expect("fixed inline length field"),
+        ) as usize;
+        let wrapped_end = header_len
+            .checked_add(wrapped_len)
+            .ok_or_else(|| anyhow::anyhow!("sealed inline length overflows"))?;
+        if wrapped_len == 0 || wrapped_end >= stored.len() {
+            anyhow::bail!("sealed inline container is truncated");
+        }
+        self.crypto
+            .decrypt_sealed_chunk(&stored[wrapped_end..], &stored[header_len..wrapped_end])
     }
 
     /// --hide-names write side: translate a dentry name into the pair stored in
@@ -444,19 +867,26 @@ impl CairnEngine {
     /// bug) — on a trusted restore machine that silently loses the real name, so
     /// it is logged loudly before degrading (same policy as the other
     /// verification-failure cases).
-    pub(crate) fn resolve_dentry_name(&self, lookup_key: &str, name_enc: Option<&[u8]>) -> ResolvedName {
-        resolve_name(&self.crypto, lookup_key, name_enc)
-    }
-
-    /// Like `Db::get_inode_name`, but decrypt-aware: on a hide-names archive
-    /// with the private key present, this returns the REAL name instead of the
-    /// lookup-key hash. Used by anything that displays/logs/reasons about a
-    /// name by extension (the compression-skip heuristic) or in an error
-    /// report (verify/scrub) — `Db::get_inode_name` alone always returns the
-    /// hash on a hide-names archive, since it has no crypto context.
-    pub(crate) fn get_resolved_inode_name(&self, inode: u64) -> anyhow::Result<String> {
-        let (lookup_key, name_enc) = self.db.get_inode_name_enc(inode)?;
-        Ok(resolve_name(&self.crypto, &lookup_key, name_enc.as_deref()).into_string())
+    pub(crate) fn resolve_dentry_name(&self, lookup_key: &str, name_enc: Option<&[u8]>) -> String {
+        if !self.crypto.hide_names {
+            return lookup_key.to_string();
+        }
+        match name_enc {
+            Some(blob) => match self.crypto.decrypt_name(blob) {
+                Ok(name) => name,
+                Err(e) => {
+                    if self.crypto.has_private_key() {
+                        tracing::error!(
+                            "hide-names: failed to decrypt name for dentry {lookup_key} \
+                             despite having the private key — the name_enc blob is corrupt; \
+                             falling back to the opaque hash: {e}"
+                        );
+                    }
+                    lookup_key.to_string()
+                }
+            },
+            None => lookup_key.to_string(),
+        }
     }
 
     pub async fn flush_range(
@@ -596,8 +1026,7 @@ impl CairnEngine {
             let comp_type = u8::try_from(*ct)
                 .map_err(|_| anyhow::anyhow!("invalid comp_type for chunk {oid}"))?;
             let plain = self
-                .crypto
-                .decrypt_chunk_symmetric(cipher, sk, comp_type, cipher_algo)
+                .decrypt_chunk_auto(oid, cipher, sk, comp_type, cipher_algo)
                 .map_err(|e| {
                     anyhow::anyhow!(
                         "Failed to decrypt chunk for Read-Modify-Write (Missing private key?): {e}"
@@ -632,8 +1061,9 @@ impl CairnEngine {
         // log a real DB error before treating the name as absent (the
         // extension hint then falls back to "compress", which is the safe default).
         let ext = self
-            .get_resolved_inode_name(ino)
-            .map_err(|e| tracing::warn!("compression-hint: get_resolved_inode_name(ino={ino}) failed: {e}"))
+            .db
+            .get_inode_name(ino)
+            .map_err(|e| tracing::warn!("compression-hint: get_inode_name(ino={ino}) failed: {e}"))
             .ok()
             .and_then(|name| {
                 std::path::Path::new(&name)
@@ -687,6 +1117,7 @@ impl CairnEngine {
             self.raid_mode.clone(),
             self.async_upload,
             comp_algo_override,
+            self.shared_dedup_write_config()?,
         )
         .await?;
 
@@ -769,7 +1200,190 @@ impl CairnEngine {
             .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
         }
 
+        // H09 digest is persisted at finalize (release), not here: computing it
+        // inside flush_range would re-read every chunk on every commit and
+        // disturb RMW/truncate semantics.
+
         Ok(())
+    }
+
+    /// H09: streaming digest of a file's logical content (sparse gaps hashed
+    /// as zeroes, no full-file allocation).  Inline files hash their unwrapped
+    /// inline blob; chunked files assemble chunk spans in offset order and
+    /// reject overlap/duplicate placement.
+    pub async fn compute_file_digest(
+        &self,
+        ino: u64,
+    ) -> anyhow::Result<crate::hashing::FileDigest> {
+        let inline = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.get_inline_data(ino))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        if let Some(wrapped) = inline {
+            let data = self.unwrap_inline(&wrapped)?;
+            let mut h = crate::hashing::FileHasher::new();
+            h.update(&data)?;
+            return Ok(h.finish());
+        }
+        let refs = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.get_file_chunks(ino))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let logical_size = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.get_inode(ino))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+                .map(|inode| inode.3)
+                .ok_or_else(|| anyhow::anyhow!("inode {ino} not found"))?
+        };
+        let mut ordered = refs;
+        ordered.sort_by_key(|(_, offset, _, _, _, _)| *offset);
+        let mut hasher = crate::hashing::FileHasher::new();
+        let mut cursor = 0u64;
+        for (oid, offset, plain_len, wrapped, comp_type, algo) in ordered {
+            let cipher = self.fetch_chunk(&oid).await?;
+            let plain = self.decrypt_chunk_auto(&oid, &cipher, &wrapped, comp_type as u8, &algo)?;
+            let plain = plain
+                .get(..plain_len)
+                .ok_or_else(|| anyhow::anyhow!("chunk span exceeds decrypted data length"))?;
+            let offset = offset as u64;
+            if offset < cursor {
+                anyhow::bail!("chunk span overlaps or duplicates earlier data");
+            }
+            hasher.update_zeros(offset - cursor)?;
+            hasher.update(plain)?;
+            cursor = offset
+                .checked_add(plain.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("chunk span end overflow"))?;
+        }
+        if cursor > logical_size {
+            anyhow::bail!("chunk spans extend beyond inode size");
+        }
+        hasher.update_zeros(logical_size - cursor)?;
+        Ok(hasher.finish())
+    }
+
+    /// H09: compute and persist the file digest (called after each successful
+    /// flush commit).
+    pub async fn store_file_digest(&self, ino: u64) -> anyhow::Result<()> {
+        let digest = self.compute_file_digest(ino).await?;
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.set_file_digest(ino, &digest.hash))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        Ok(())
+    }
+
+    /// H09: full-file verification against the last stored digest.  Returns an
+    /// error on any mismatch (content, order or size) or missing stored digest.
+    pub async fn verify_file_digest(&self, ino: u64) -> anyhow::Result<()> {
+        let stored = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.get_file_digest(ino))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        }
+        .ok_or_else(|| anyhow::anyhow!("file {ino} has no stored digest to verify against"))?;
+        let expected = {
+            let db = self.db.clone();
+            let ino2 = ino;
+            tokio::task::spawn_blocking(move || db.get_inode(ino2))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        }
+        .map(|i| i.3)
+        .unwrap_or(0);
+        let actual = self.compute_file_digest(ino).await?;
+        if actual.hash != stored || actual.logical_size != expected {
+            anyhow::bail!(
+                "file {ino} digest mismatch: expected logical size {expected}, computed logical size {}",
+                actual.logical_size,
+            );
+        }
+        Ok(())
+    }
+
+    /// H11: verify with a stable read (stat before, verify, stat after).
+    /// When `(size, mtime_sec, mtime_nsec)` changes concurrently with the
+    /// check, the result is `ChangedDuringRead` instead of a silent pass.
+    pub async fn verify_file_stable(&self, ino: u64) -> VerifyOutcome {
+        fn stat_tuple(db: &cairn_index::Db, ino: u64) -> Option<(u64, u64, u64)> {
+            let inner = db.get_inode(ino).ok()??;
+            let (mode, _uid, _gid, size, _nlink, mtime_sec, mtime_nsec) = inner;
+            if (mode & 0o170000) != 0o100000 {
+                return None;
+            }
+            Some((size, mtime_sec as u64, mtime_nsec as u64))
+        }
+
+        let db = self.db.clone();
+        let pre = tokio::task::spawn_blocking(move || stat_tuple(&db, ino)).await;
+        let Some((pre_size, pre_mtime_sec, pre_mtime_nsec)) = pre.ok().flatten() else {
+            return VerifyOutcome::Unverified("inode missing or not a regular file".into());
+        };
+
+        match self.verify_file_digest(ino).await {
+            Err(e) => VerifyOutcome::Unverified(e.to_string()),
+            Ok(()) => {
+                let db = self.db.clone();
+                let post = tokio::task::spawn_blocking(move || stat_tuple(&db, ino)).await;
+                let post_t = post.ok().flatten();
+                let changed = match post_t {
+                    Some((ps, pms, pmn)) => {
+                        (ps, pms, pmn) != (pre_size, pre_mtime_sec, pre_mtime_nsec)
+                    }
+                    None => true,
+                };
+                if changed {
+                    VerifyOutcome::ChangedDuringRead {
+                        bytes_read: pre_size,
+                    }
+                } else {
+                    VerifyOutcome::Verified {
+                        bytes_read: pre_size,
+                    }
+                }
+            }
+        }
+    }
+
+    /// H09/H08: restore-check over the WHOLE tree.  Returns how many files
+    /// verified against their stored digest and, when a digest is missing,
+    /// the reason — so a restore/scrub can fail (or report) instead of
+    /// silently assuming success.  Call this after a restore completes.
+    pub async fn verify_all_file_digests(&self) -> anyhow::Result<VerifyAllReport> {
+        let regular = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.list_regular_files())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let mut report = VerifyAllReport::default();
+        for (ino, _size) in regular {
+            match self.verify_file_stable(ino).await {
+                VerifyOutcome::Verified { bytes_read } => {
+                    report.verified += 1;
+                    report.bytes_read += bytes_read;
+                }
+                VerifyOutcome::ChangedDuringRead { bytes_read } => {
+                    report.changed_during_read += 1;
+                    report.bytes_read += bytes_read;
+                }
+                VerifyOutcome::Unverified(msg) => {
+                    if msg.contains("no stored digest") {
+                        report.missing_digest += 1;
+                    } else {
+                        report.failed.push((ino, msg));
+                    }
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Store an existing inline blob as a standalone chunk at offset 0 and clear
@@ -793,6 +1407,7 @@ impl CairnEngine {
             self.raid_mode.clone(),
             self.async_upload,
             None,
+            self.shared_dedup_write_config()?,
         )
         .await?;
         drop(_permit);
@@ -819,7 +1434,8 @@ impl CairnEngine {
     }
 
     pub async fn fetch_chunk(&self, hash_key: &str) -> anyhow::Result<Vec<u8>> {
-        self.store
+        match self
+            .store
             .fetch_chunk(
                 hash_key,
                 &self.raid_mode,
@@ -828,6 +1444,35 @@ impl CairnEngine {
                 self.force_remote_read,
             )
             .await
+        {
+            Ok(ciphertext) => Ok(ciphertext),
+            Err(original) if self.db.get_chunk_domain(hash_key)? => {
+                let store_dir = self
+                    .db
+                    .get_config("dedup_shared_store_dir")?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "shared-domain chunk {hash_key} has no configured domain store"
+                        )
+                    })?;
+                let namespace = self
+                    .db
+                    .get_config("dedup_shared_namespace")?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "shared-domain chunk {hash_key} has no configured namespace"
+                        )
+                    })?;
+                let ciphertext =
+                    cairn_store::shared_dedup::read_shared_object(&store_dir, &namespace, hash_key)
+                        .map_err(|e| {
+                            anyhow::anyhow!("{original}; shared-domain fallback failed: {e}")
+                        })?;
+                cacache::write(&self.cache_dir, hash_key, &ciphertext).await?;
+                Ok(ciphertext)
+            }
+            Err(original) => Err(original),
+        }
     }
 
     #[cfg(feature = "cloud-storage")]
@@ -857,18 +1502,21 @@ impl CairnEngine {
         let mut manifest_chunks = Vec::new();
         for chunk in chunker {
             let slice = &db_bytes[chunk.offset..chunk.offset + chunk.length];
-            let sym_key = self.crypto.generate_chunk_key(slice)?;
-            let (ciphertext, comp_type) = self
+            let sealed = self
                 .crypto
-                .encrypt_chunk_symmetric(slice, &sym_key, None)
+                .seal_chunk(slice, None)
                 .map_err(|e| anyhow::anyhow!("Crypto error: {e}"))?;
 
-            let wrapped_key = self
-                .crypto
-                .encrypt_blob(&sym_key)
-                .map_err(|e| anyhow::anyhow!("Envelope error: {e}"))?;
-
-            let hash = blake3::hash(&ciphertext).to_hex().to_string();
+            let manifest_chunk = crate::ManifestChunk {
+                hash: sealed.object_id,
+                wrapped_key: sealed.wrapped_key,
+                comp_type: sealed.comp_type,
+                cipher_algo: sealed.cipher_algo,
+            };
+            let hash = manifest_chunk.hash.clone();
+            let ciphertext = sealed.ciphertext;
+            let comp_type = manifest_chunk.comp_type;
+            let wrapped_key = manifest_chunk.wrapped_key;
 
             // index chunks follow the same rule as data chunks — the S3
             // object is the raw ciphertext (`blake3 == hash`); the wrapped key
@@ -892,16 +1540,13 @@ impl CairnEngine {
         };
         let manifest_bytes = serde_json::to_vec(&manifest)?;
 
-        let sym_key = self.crypto.generate_chunk_key(&manifest_bytes)?;
-        let (ciphertext, comp_type) = self
+        let sealed_manifest = self
             .crypto
-            .encrypt_chunk_symmetric(&manifest_bytes, &sym_key, None)
+            .seal_chunk(&manifest_bytes, None)
             .map_err(|e| anyhow::anyhow!("Crypto error: {e}"))?;
-
-        let wrapped_key = self
-            .crypto
-            .encrypt_blob(&sym_key)
-            .map_err(|e| anyhow::anyhow!("Envelope error: {e}"))?;
+        let ciphertext = sealed_manifest.ciphertext;
+        let comp_type = sealed_manifest.comp_type;
+        let wrapped_key = sealed_manifest.wrapped_key;
 
         // see cairn-cdc/src/lib.rs.
         if wrapped_key.len() > u16::MAX as usize {
@@ -954,14 +1599,798 @@ impl CairnEngine {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ManifestChunk {
+    pub hash: String,
+    pub wrapped_key: Vec<u8>,
+    pub comp_type: u8,
+    pub cipher_algo: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    pub chunks: Vec<ManifestChunk>,
+}
+
+#[cfg(feature = "cloud-storage")]
+pub async fn restore_index_from_cloud(
+    operators: &[cairn_store::CloudOperator],
+    crypto: &cairn_seal::CryptoCtx,
+    archive_path: &str,
+    cache_dir: &str,
+    raid_mode: &str,
+) -> anyhow::Result<()> {
+    if operators.is_empty() {
+        return Err(anyhow::anyhow!("No cloud operators configured for restore"));
+    }
+
+    tracing::info!("Downloading index database backup from S3...");
+    let s3_path = "meta/archive.db.enc";
+
+    // Try to read from the first operator that succeeds
+    let mut data = None;
+    for op in operators {
+        match op.read(s3_path).await {
+            Ok(d) => {
+                data = Some(d);
+                break;
+            }
+            // don't silently skip a failing backend — "first success wins"
+            // is fine, but a steadily-degrading backend must not be invisible.
+            Err(e) => tracing::warn!(
+                "restore_index_from_cloud: a backend read failed, trying the next: {e}"
+            ),
+        }
+    }
+
+    let data = data
+        .ok_or_else(|| anyhow::anyhow!("Failed to download index backup from any S3 operator"))?;
+    let data = data.to_vec();
+
+    if data.len() < 4 {
+        return Err(anyhow::anyhow!("Downloaded index backup is too small"));
+    }
+
+    let wk_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+    if data.len() < 2 + wk_len + 2 {
+        return Err(anyhow::anyhow!(
+            "Downloaded index backup is corrupted (invalid key length)"
+        ));
+    }
+
+    let wrapped_key = &data[2..2 + wk_len];
+    let _comp_type = data[2 + wk_len];
+    let algo_len = data[2 + wk_len + 1] as usize;
+
+    if data.len() < 2 + wk_len + 2 + algo_len {
+        return Err(anyhow::anyhow!(
+            "Downloaded index backup is corrupted (invalid algo length)"
+        ));
+    }
+
+    let algo_bytes = &data[2 + wk_len + 2..2 + wk_len + 2 + algo_len];
+    let _cipher_algo = String::from_utf8(algo_bytes.to_vec())
+        .map_err(|_| anyhow::anyhow!("Invalid cipher algo in backup"))?;
+
+    let ciphertext = &data[2 + wk_len + 2 + algo_len..];
+
+    tracing::info!("Decrypting index database manifest...");
+    let manifest_bytes = crypto
+        .decrypt_sealed_chunk(ciphertext, wrapped_key)
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt index backup: {e}"))?;
+
+    let manifest: crate::Manifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to parse index manifest: {e}"))?;
+
+    use cairn_store::ChunkStore;
+    let store = cairn_store::CairnStore::new(cache_dir.to_string(), operators.to_vec(), None);
+
+    let mut db_bytes = Vec::new();
+    for chunk in manifest.chunks {
+        let cipher = store
+            .fetch_chunk(&chunk.hash, raid_mode, false, false, false)
+            .await?;
+        let dec = crypto
+            .decrypt_sealed_chunk(&cipher, &chunk.wrapped_key)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt index chunk {}: {}", chunk.hash, e))?;
+        db_bytes.extend_from_slice(&dec);
+    }
+
+    std::fs::write(archive_path, db_bytes)?;
+    tracing::info!("Successfully restored index database to {}", archive_path);
+
+    Ok(())
+}
+
 // Concrete directory-listing stream types (were the Filesystem assoc types). The
 // thin adapter (cairn-fuse) re-declares its GATs as aliases of these.
 
 // These are the filesystem OPERATIONS as INHERENT methods (they keep the exact
 // fuse3 signatures the trait had). cairn-fuse's `impl Filesystem for CairnFs`
 // delegates to each of them. cairn-core stays fuse3-typed (engine/adapter seam,
-// not a fuse-independent core).
+// not a fuse-independent core — see MIGRATION.md).
 impl CairnEngine {
+    /// H12: compare the protected reference set (chunk_index) with every
+    /// durable ciphertext object present in the pool's backends.  Returns
+    /// missing, corrupt and unreferenced sets.  Requires at least one
+    /// cloud operator (the local-only backend doesn't list remote objects).
+    #[cfg(feature = "cloud-storage")]
+    pub async fn archive_inventory(&self) -> anyhow::Result<crate::hashing::InventoryReport> {
+        let referenced = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.list_all_object_hashes())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+
+        let mut available: Vec<(String, Vec<u8>)> = Vec::new();
+        for op in &self.operators {
+            let lister = op
+                .list("chunks/")
+                .await
+                .map_err(|e| anyhow::anyhow!("list chunks/ failed: {e}"))?;
+            for entry in lister {
+                let path = entry.path();
+                let id = path.strip_prefix("chunks/").unwrap_or(path).to_string();
+                let bytes = op
+                    .read(path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read {path}: {e}"))?
+                    .to_vec();
+                available.push((id, bytes));
+            }
+        }
+        // Remote listings are not a transactionally consistent snapshot of all
+        // stores.  A concurrent publish can otherwise be reported as an orphan.
+        // Callers must obtain a separate completeness proof before using this
+        // report to plan destructive reclamation.
+        Ok(crate::hashing::inventory_report(
+            referenced, available, false,
+        ))
+    }
+
+    /// H13: read-only replication audit.  For every referenced object checks,
+    /// per configured operator, whether the durable replica is PRESENT and
+    /// byte-exact (`replica_matches` — blake3 of stored bytes === object id).
+    /// No writes are performed; verified-only objects are the safe skip-set for
+    /// a later resumable copy.
+    #[cfg(feature = "cloud-storage")]
+    pub async fn replication_audit(&self) -> anyhow::Result<ReplicaAudit> {
+        // BF-04.8: this audit models "one full ciphertext replica per backend",
+        // which is only true for raid1/fallback. On raid0/raid10 a healthy
+        // backend legitimately lacks most objects (reported missing), and on
+        // raid5/6 every shard hashes differently from the object id (reported
+        // corrupt). Refuse loudly instead of reporting a healthy array as
+        // damaged until a layout-aware audit exists.
+        if !matches!(self.raid_mode.as_str(), "" | "1" | "raid1") {
+            anyhow::bail!(
+                "replica audit is not layout-aware for raid_mode '{}': one-replica-per-backend \
+                 accounting would report healthy backends as missing/corrupt",
+                self.raid_mode
+            );
+        }
+        let object_ids = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.list_all_object_hashes())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let mut verified: Vec<(String, usize)> = Vec::new();
+        let mut missing: Vec<(String, usize)> = Vec::new();
+        let mut corrupt: Vec<(String, usize)> = Vec::new();
+
+        for (op_index, op) in self.operators.iter().enumerate() {
+            for id in &object_ids {
+                let path = format!("chunks/{id}");
+                match op.read(&path).await {
+                    Ok(buf) => {
+                        if crate::hashing::replica_matches(id, &buf.to_vec()) {
+                            verified.push((id.clone(), op_index));
+                        } else {
+                            corrupt.push((id.clone(), op_index));
+                        }
+                    }
+                    Err(_) => missing.push((id.clone(), op_index)),
+                }
+            }
+        }
+        Ok(ReplicaAudit {
+            verified,
+            missing,
+            corrupt,
+        })
+    }
+
+    /// H13b: resumable read-write repair.  For each referenced object, copies
+    /// from the FIRST healthy source (a store replica or the local cache —
+    /// always verified by `replica_matches`) into every other store where the
+    /// replica is missing or corrupt.  Never claims success for an object with
+    /// NO verified source; never repairs from an unverified source.
+    #[cfg(feature = "cloud-storage")]
+    pub async fn replicate_repair(&self) -> anyhow::Result<ReplicateReport> {
+        // A RAID5/6 backend stores distinct encoded shards, not the raw
+        // ciphertext addressed by `object_id`.  This repair loop operates on
+        // whole ciphertext replicas; writing those bytes into a shard slot
+        // would corrupt an otherwise recoverable stripe.  Refuse until a
+        // shard-aware repair primitive exists.
+        //
+        // BF-04.8: raid0/raid10 are refused too — this loop writes the full
+        // ciphertext to EVERY backend whose read fails, which silently turns a
+        // 1-of-N (raid0) or 2-of-N (raid10) layout into N full copies.
+        if !matches!(self.raid_mode.as_str(), "" | "1" | "raid1") {
+            anyhow::bail!(
+                "replica repair is not layout-aware for raid_mode '{}'; writing whole replicas \
+                 would corrupt shards (raid5/6) or amplify copies (raid0/raid10)",
+                self.raid_mode
+            );
+        }
+        let object_ids = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.list_all_object_hashes())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let mut repaired = 0usize;
+        let mut verified_skipped = 0usize;
+        let mut unrepaired: Vec<(String, usize)> = Vec::new();
+
+        for id in &object_ids {
+            let path = format!("chunks/{id}");
+            let mut source: Option<Vec<u8>> = None;
+            for op in &self.operators {
+                if let Ok(buf) = op.read(&path).await {
+                    if crate::hashing::replica_matches(id, &buf.to_vec()) {
+                        source = Some(buf.to_vec());
+                        break;
+                    }
+                }
+            }
+            if source.is_none() {
+                if let Ok(buf) = cacache::read(&self.cache_dir, id).await {
+                    let buf = buf.to_vec();
+                    if crate::hashing::replica_matches(id, &buf) {
+                        source = Some(buf);
+                    }
+                }
+            }
+
+            let Some(source) = source else {
+                for (idx, _op) in self.operators.iter().enumerate() {
+                    unrepaired.push((id.clone(), idx));
+                }
+                continue;
+            };
+
+            for (op_index, op) in self.operators.iter().enumerate() {
+                let healthy = match op.read(&path).await {
+                    Ok(buf) => crate::hashing::replica_matches(id, &buf.to_vec()),
+                    Err(_) => false,
+                };
+                if healthy {
+                    verified_skipped += 1;
+                } else {
+                    op.write(&path, source.clone())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("repair write {path}: {e}"))?;
+                    match op.read(&path).await {
+                        Ok(written) if crate::hashing::replica_matches(id, &written.to_vec()) => {
+                            repaired += 1;
+                        }
+                        _ => unrepaired.push((id.clone(), op_index)),
+                    }
+                }
+            }
+        }
+        Ok(ReplicateReport {
+            repaired,
+            verified_skipped,
+            unrepaired,
+        })
+    }
+
+    /// H14: deduplication statistics.  Logical file bytes (regular incl.
+    /// inline), ACTUAL stored ciphertext bytes (each unique object read once),
+    /// naive stored figure (sum of compressed plaintext lengths), orphan count
+    /// and achieved savings.  Inline adds logical bytes but no pool objects.
+    /// Cost: reads every unique object once.
+    pub async fn dedup_stats(&self) -> anyhow::Result<DedupStats> {
+        let regular = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.list_regular_files())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let mut logical_file_bytes = 0u64;
+        let mut inline_logical_bytes = 0u64;
+        for (ino, size) in regular {
+            logical_file_bytes += size;
+            let is_inline = {
+                let db = self.db.clone();
+                tokio::task::spawn_blocking(move || db.get_inline_data(ino))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+            }
+            .is_some();
+            if is_inline {
+                inline_logical_bytes += size;
+            }
+        }
+        let unique_objects = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.list_all_object_hashes())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let mut unique_object_bytes = 0u64;
+        for id in &unique_objects {
+            let bytes = self.fetch_chunk(id).await?;
+            unique_object_bytes += bytes.len() as u64;
+        }
+        let compressed_stored_bytes = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.total_plain_bytes())
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let orphaned = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.get_orphaned_chunks(0))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+                .unwrap_or_default()
+        };
+        let savings_percent = if logical_file_bytes > 0 {
+            (1.0 - unique_object_bytes as f64 / logical_file_bytes as f64).max(0.0) * 100.0
+        } else {
+            0.0
+        };
+        Ok(DedupStats {
+            logical_file_bytes,
+            inline_logical_bytes,
+            unique_object_count: unique_objects.len(),
+            unique_object_bytes,
+            compressed_stored_bytes,
+            orphaned_objects: orphaned.len() as u64,
+            savings_percent,
+        })
+    }
+
+    /// H15: record the newest snapshot's tree root as a TRUSTED CHECKPOINT
+    /// OUTSIDE the attackable stores (e.g. an admin-machine file that is never
+    /// written by the cloud backends).  The checkpoint is advanced only for a
+    /// strictly-newer immutable snapshot id and only when the snapshot has an authenticated
+    /// root — losing/refusing the checkpoint must fail, never silently trust.
+    pub async fn record_checkpoint(
+        &self,
+        snap_id: u64,
+        checkpoint_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let (seq, root) = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || {
+                let snaps = db.list_snapshots()?;
+                let snap = snaps
+                    .iter()
+                    .find(|(id, _, _)| *id == snap_id)
+                    .ok_or_else(|| anyhow::anyhow!("snapshot {snap_id} not found"))?;
+                let root = db.snapshot_tree_root(snap.0)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "snapshot {snap_id} has no authenticated root; refusing to checkpoint"
+                    )
+                })?;
+                Ok::<_, anyhow::Error>((snap.0, root))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+
+        // Atomic replace; never regress the checkpoint to an older timestamp.
+        // BF-04.9: the read-check-write runs under an exclusive file lock, so
+        // two concurrent recorders cannot both pass the sequence check and let
+        // the older write win.
+        let _lock = CheckpointLock::acquire(checkpoint_path)?;
+        let existing = Self::read_checkpoint(checkpoint_path)?;
+        if let Some((exists_seq, _)) = existing {
+            if seq <= exists_seq {
+                anyhow::bail!(
+                    "checkpoint at {checkpoint_path:?} already at seq {exists_seq}; refusing to regress to {seq}"
+                );
+            }
+        }
+        let payload = format!("seq={seq}\nroot={}\n", bytes_hex(&root));
+        Self::atomic_write_private(checkpoint_path, payload.as_bytes())?;
+        Ok(())
+    }
+
+    /// Deliberately replace a checkpoint after an operator-approved retention
+    /// rollback.  This is intentionally separate from `record_checkpoint` so
+    /// ordinary callers retain the no-regression guarantee.
+    pub async fn recheckpoint_after_prune(
+        &self,
+        snap_id: u64,
+        checkpoint_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let root = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || {
+                db.snapshot_tree_root(snap_id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "snapshot {snap_id} has no authenticated root; refusing to checkpoint"
+                    )
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        // BF-04.9: serialize explicit re-anchors with ordinary recordings too
+        // (the rewrite itself remains deliberate and unconditional).
+        let _lock = CheckpointLock::acquire(checkpoint_path)?;
+        let payload = format!("seq={snap_id}\nroot={}\n", bytes_hex(&root));
+        Self::atomic_write_private(checkpoint_path, payload.as_bytes())
+    }
+
+    /// H15: verify that `snap_id` is the latest state per the trusted
+    /// checkpoint -- rejects an older snapshot (rollback) and a root mismatch
+    /// (tampering).  A missing/corrupt checkpoint is an explicit refusal,
+    /// never a silent pass.
+    pub async fn verify_snapshot_against_checkpoint(
+        &self,
+        snap_id: u64,
+        checkpoint_path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let (seq, root) = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || {
+                let snaps = db.list_snapshots()?;
+                let snap = snaps
+                    .iter()
+                    .find(|(id, _, _)| *id == snap_id)
+                    .ok_or_else(|| anyhow::anyhow!("snapshot {snap_id} not found"))?;
+                let root = db.snapshot_tree_root(snap.0)?.ok_or_else(|| {
+                    anyhow::anyhow!("snapshot {snap_id} has no authenticated root")
+                })?;
+                Ok::<_, anyhow::Error>((snap.0, root))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+        let Some((cp_seq, cp_root)) = Self::read_checkpoint(checkpoint_path)? else {
+            anyhow::bail!("no trusted checkpoint at {checkpoint_path:?}; refusing to validate");
+        };
+        if cp_seq > seq {
+            anyhow::bail!(
+                "snapshot {snap_id} (seq {seq}) is OLDER than the checkpoint (seq {cp_seq}) -- rollback"
+            );
+        }
+        if cp_seq == seq && cp_root != root {
+            anyhow::bail!("snapshot root does not match the trusted checkpoint (tampered)");
+        }
+        Ok(())
+    }
+
+    const SNAPSHOT_ROOT_INO: u64 = 1;
+
+    /// H15: restore ONE file from a snapshot, authenticated end-to-end:
+    /// 1. the snapshot must not be older than the TRUSTED checkpoint (rollback),
+    /// 2. the file's leaf hash (kind·mode·name·file_digest) must be provably a
+    ///    member of the snapshot's authenticated Merkle root (an inclusion
+    ///    chain walked from the leaf up to `snapshot_tree_root`),
+    /// 3. the chunk data read back from the store must match the stored file
+    ///    digest (a path/digest mismatch is a loud error, never a silent file),
+    /// 4. the result is written atomically (temp + rename) to `out_path`.
+    ///
+    /// `path` is root-relative (`"a/b.txt"` or `"/a/b.txt"`). Directories and
+    /// symlinks are rejected: only authenticated regular files are restorable.
+    pub async fn restore_path_from_snapshot(
+        &self,
+        snap_id: u64,
+        path: &str,
+        checkpoint_path: &std::path::Path,
+        out_path: &std::path::Path,
+    ) -> anyhow::Result<u64> {
+        // Freshness gate first: an old snapshot must not silently win.
+        self.verify_snapshot_against_checkpoint(snap_id, checkpoint_path)
+            .await?;
+
+        let expected_root = {
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.snapshot_tree_root(snap_id))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+                .ok_or_else(|| anyhow::anyhow!("snapshot {snap_id} has no authenticated root"))?
+        };
+
+        // Materialize the snapshot's point-in-time database (temp file) and
+        // open it with the SAME credentials as the live archive.
+        let snap_dir = tempfile::tempdir()?;
+        let snap_file = snap_dir.path().join("snapshot.db");
+        {
+            let db = self.db.clone();
+            let f = snap_file.clone();
+            tokio::task::spawn_blocking(move || db.extract_snapshot(snap_id, f.to_str().unwrap()))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        }
+        let snap_db = {
+            let db = self.db.clone();
+            let f = snap_file.clone();
+            tokio::task::spawn_blocking(move || {
+                // BF-04.2: the frozen copy was written with the ARCHIVE's cipher
+                // parameters; opening it with Db defaults makes every archive
+                // created with a non-default --db-kdf-iter / CAIRN_KDF_ITER
+                // unreadable here (wrong password error) even though the live
+                // DB opens fine.
+                let tuning = cairn_index::DbTuning {
+                    kdf_iter: db.kdf_iter(),
+                    ..Default::default()
+                };
+                cairn_index::Db::new_with_tuning(f.to_str().unwrap(), db.password(), &tuning)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        };
+
+        let (ino, name, mode, parent_ino) = {
+            let db = snap_db.clone();
+            let p = path.to_string();
+            tokio::task::spawn_blocking(move || Self::resolve_path_db(&db, &p))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+                .ok_or_else(|| anyhow::anyhow!("path {path:?} not found in snapshot {snap_id}"))?
+        };
+
+        // Inclusion chain: prove the leaf is in the snapshot's authenticated root.
+        {
+            let db = snap_db.clone();
+            let (i, n, m) = (ino, name.clone(), mode);
+            tokio::task::spawn_blocking(move || {
+                Self::verify_snapshot_inclusion(&db, i, &n, m, parent_ino, expected_root)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        }
+
+        let content = self
+            .read_file_all_from_db(&snap_db, ino)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("inode {ino} has no readable content"))?;
+
+        // The restored bytes must match the stored file digest (the same value
+        // the snapshot leaf binds) before anything touches `out_path`.
+        let stored_hash = {
+            let db = snap_db.clone();
+            let i = ino;
+            tokio::task::spawn_blocking(move || db.get_file_digest(i))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+                .ok_or_else(|| anyhow::anyhow!("inode {ino} has no authenticated digest"))?
+        };
+        let stored_size = {
+            let db = snap_db.clone();
+            let i = ino;
+            tokio::task::spawn_blocking(move || db.get_inode(i))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+                .map(|(_, _, _, size, _, _, _)| size)
+                .ok_or_else(|| anyhow::anyhow!("inode {ino} missing"))?
+        };
+        let mut fh = crate::hashing::FileHasher::new();
+        fh.update(&content)?;
+        let actual_digest = fh.finish();
+        if actual_digest.hash != stored_hash || actual_digest.logical_size != stored_size {
+            anyhow::bail!("restored file digest does not match snapshot (corrupt or tampered)");
+        }
+
+        // Atomic write: temp in the same directory, fsync, rename.
+        let parent = out_path.parent().unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        Self::atomic_write_private(out_path, &content)?;
+
+        Ok(content.len() as u64)
+    }
+
+    /// Resolve a root-relative path (`"a/b.txt"` or `"/a/b.txt"`) inside the
+    /// given database to its inode. Returns `(ino, basename, mode)`.
+    /// BF-04.3: also return the dentry's actual parent inode. A hardlinked
+    /// inode has several parents, and `Db::get_parent_inode` (LIMIT 1) may
+    /// return one that does not correspond to the requested path — the caller
+    /// must thread the resolved (parent, name) into the inclusion proof.
+    fn resolve_path_db(
+        db: &cairn_index::Db,
+        path: &str,
+    ) -> anyhow::Result<Option<(u64, String, u32, u64)>> {
+        let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.is_empty() {
+            return Ok(None); // the tree root itself is not a file
+        }
+        let mut parent = Self::SNAPSHOT_ROOT_INO;
+        for (i, comp) in comps.iter().enumerate() {
+            if *comp == "." || *comp == ".." {
+                anyhow::bail!("path must not contain '.' or '..' components");
+            }
+            let ino = match db.get_dentry_inode(parent, comp)? {
+                Some(ino) => ino,
+                None => return Ok(None),
+            };
+            if i == comps.len() - 1 {
+                let mode = match db.get_inode(ino)? {
+                    Some((mode, _, _, _, _, _, _)) => mode,
+                    None => return Ok(None),
+                };
+                return Ok(Some((ino, comp.to_string(), mode, parent)));
+            }
+            parent = ino;
+        }
+        Ok(None)
+    }
+
+    fn snapshot_kind(mode: u32) -> Option<u8> {
+        match mode & 0o170000 {
+            0o040000 => Some(2), // directory
+            0o100000 => Some(1), // regular file
+            0o120000 => Some(3), // symlink target digest
+            _ => None,           // fifo/…: not authenticated
+        }
+    }
+
+    /// H15: leaf hash in the exact encoding of `cairn-index::node_hash` /
+    /// `tree_root` (kind·mode, length-prefixed name, content hash WITHOUT a
+    /// separate logical_size — the size is already bound inside the file
+    /// digest). The stored snapshot root and the trusted checkpoint are both
+    /// produced by `tree_root`, so the inclusion chain must use THIS encoding,
+    /// not the flat-list `hashing::snapshot_entry_hash` (which additionally
+    /// binds `logical_size`).
+    fn snapshot_leaf(kind: u8, mode: u32, name: &str, content: [u8; 32]) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_derive_key("cairn snapshot entry v1");
+        h.update(&[kind]);
+        h.update(&mode.to_le_bytes());
+        h.update(&(name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(&content);
+        *h.finalize().as_bytes()
+    }
+
+    /// Walk the inclusion chain from a node up to the snapshot root and prove
+    /// (with Merkle inclusion proofs at every level) that the node's leaf hash
+    /// is a member of `expected_root`. Directory contents bind
+    /// `merkle_root_consistent(children)` exactly like `cairn-index::tree_root`.
+    fn verify_snapshot_inclusion(
+        db: &cairn_index::Db,
+        mut cur_ino: u64,
+        cur_name: &str,
+        cur_mode: u32,
+        parent_ino: u64,
+        expected_root: [u8; 32],
+    ) -> anyhow::Result<()> {
+        // Owned so the climb can replace it with each ancestor's name; the
+        // caller's `cur_name` is the exact dentry name of the requested path.
+        let mut cur_name = cur_name.to_string();
+        // BF-04.3: the first hop must use the PARENT OF THE REQUESTED PATH, not
+        // `get_parent_inode` (LIMIT 1, arbitrary for hardlinks); deeper hops are
+        // directories, which have exactly one dentry.
+        let mut known_parent: Option<u64> = Some(parent_ino);
+        let mut cur_hash = {
+            let kind = Self::snapshot_kind(cur_mode)
+                .ok_or_else(|| anyhow::anyhow!("node {cur_name:?} is not an authenticated kind"))?;
+            let content = if kind == 1 || kind == 3 {
+                db.get_file_digest(cur_ino)?
+                    .ok_or_else(|| anyhow::anyhow!("node {cur_name:?} has no stored digest"))?
+            } else {
+                anyhow::bail!("path resolves to a non-file node");
+            };
+            Self::snapshot_leaf(kind, cur_mode, &cur_name, content)
+        };
+
+        loop {
+            // Reaching the root node: the final entry hash binds the empty name.
+            if cur_ino == Self::SNAPSHOT_ROOT_INO {
+                if cur_hash != expected_root {
+                    anyhow::bail!("inclusion chain does not match the snapshot root (tampered)");
+                }
+                return Ok(());
+            }
+
+            let parent = match known_parent.take() {
+                Some(p) => p,
+                None => db.get_parent_inode(cur_ino)?,
+            };
+            let children = db
+                .children_nodes(parent)?
+                .ok_or_else(|| anyhow::anyhow!("tree not fully authenticated at parent"))?;
+            // Match (name, inode) — the same inode can legitimately appear
+            // several times under one parent (two hardlinks in one directory),
+            // and an id-only match could select the sibling entry, failing a
+            // healthy file's proof.
+            let idx = children
+                .iter()
+                .position(|(n, id, _, _)| *id == cur_ino && n == &cur_name)
+                .or_else(|| children.iter().position(|(_, id, _, _)| *id == cur_ino))
+                .ok_or_else(|| anyhow::anyhow!("inode {cur_ino} not found among its parent"))?;
+            let hashes: Vec<[u8; 32]> = children.iter().map(|(_, _, _, h)| *h).collect();
+
+            let proof = crate::hashing::merkle_proof_for(&hashes, idx).ok_or_else(|| {
+                anyhow::anyhow!("cannot build inclusion proof for inode {cur_ino}")
+            })?;
+            let children_root = crate::hashing::merkle_root_consistent(&hashes);
+            if !crate::hashing::verify_merkle_inclusion(&children_root, &cur_hash, &proof) {
+                anyhow::bail!("inclusion proof failed at parent of inode {cur_ino} (tampered)");
+            }
+
+            if parent == Self::SNAPSHOT_ROOT_INO {
+                // Parent is the root directory: its entry hash (empty name) is
+                // the tree root itself anchored by the stored snapshot root.
+                let p_mode = match db.get_inode(parent)? {
+                    Some((mode, _, _, _, _, _, _)) => mode,
+                    None => anyhow::bail!("parent inode missing"),
+                };
+                let root_leaf = Self::snapshot_leaf(2, p_mode, "", children_root);
+                if root_leaf != expected_root {
+                    anyhow::bail!("inclusion chain does not match the snapshot root (tampered)");
+                }
+                return Ok(());
+            }
+
+            // Otherwise climb: the parent's own node hash enters its parent.
+            let (p_name, p_mode) = match db.get_inode(parent)? {
+                Some((mode, _, _, _, _, _, _)) => (db.get_inode_name(parent)?, mode),
+                None => anyhow::bail!("parent inode missing"),
+            };
+            cur_hash = Self::snapshot_leaf(2, p_mode, &p_name, children_root);
+            cur_ino = parent;
+            cur_name = p_name;
+        }
+    }
+
+    /// Parse the trusted checkpoint file; returns None when it is absent.
+    fn read_checkpoint(path: &std::path::Path) -> anyhow::Result<Option<(u64, [u8; 32])>> {
+        let raw = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => anyhow::bail!("cannot read checkpoint {path:?}: {e}"),
+        };
+        let text =
+            std::str::from_utf8(&raw).map_err(|_| anyhow::anyhow!("checkpoint is not UTF-8"))?;
+        let mut seq: Option<u64> = None;
+        let mut root_hex: Option<&str> = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("seq=") {
+                seq = Some(
+                    rest.parse::<u64>()
+                        .map_err(|_| anyhow::anyhow!("bad seq"))?,
+                );
+            } else if let Some(rest) = line.strip_prefix("root=") {
+                root_hex = Some(rest);
+            }
+        }
+        let seq = seq.ok_or_else(|| anyhow::anyhow!("checkpoint missing seq"))?;
+        let root_hex = root_hex.ok_or_else(|| anyhow::anyhow!("checkpoint missing root"))?;
+        if root_hex.len() != 64 {
+            anyhow::bail!("checkpoint root has wrong length");
+        }
+        let root_bytes =
+            hex::decode(root_hex).map_err(|_| anyhow::anyhow!("checkpoint root not hex"))?;
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&root_bytes);
+        Ok(Some((seq, root)))
+    }
+
+    /// Write replacement content without following an attacker-controlled
+    /// temporary symlink.  `NamedTempFile` creates the temporary entry with
+    /// O_EXCL in the target directory; persisting it keeps rename atomic.
+    fn atomic_write_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        temp.write_all(bytes)?;
+        temp.as_file().sync_all()?;
+        temp.persist(path)
+            .map_err(|e| anyhow::anyhow!("atomic write to {path:?} failed: {}", e.error))?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
     pub async fn init(&self, _req: Request) -> std::io::Result<u32> {
         Ok(self.max_write)
     }
@@ -1047,6 +2476,13 @@ impl CairnEngine {
         offset: u64,
         size: u32,
     ) -> std::io::Result<Vec<u8>> {
+        tracing::trace!(
+            "cairn_core::read STARTED for ino {} offset {} size {}",
+            ino,
+            offset,
+            size
+        );
+
         let db1 = self.db.clone();
         let inode_info = tokio::task::spawn_blocking(move || db1.get_inode(ino))
             .await
@@ -1215,8 +2651,7 @@ impl CairnEngine {
                 let comp_type_u8 = u8::try_from(comp_type)
                     .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
                 let dec = self
-                    .crypto
-                    .decrypt_chunk_symmetric(cipher, &wrapped_key, comp_type_u8, &cipher_algo)
+                    .decrypt_chunk_auto(&hash, cipher, &wrapped_key, comp_type_u8, &cipher_algo)
                     .map_err(CairnEngine::to_eio)?;
                 let dec_len = dec.len();
 
@@ -1318,6 +2753,12 @@ impl CairnEngine {
         _write_flags: u32,
         _flags: u32,
     ) -> std::io::Result<u32> {
+        tracing::trace!(
+            "cairn_core::write STARTED for ino {} offset {} len {}",
+            ino,
+            offset,
+            data.len()
+        );
         let lock = self.get_write_lock(ino);
         let _guard = lock.lock().await;
 
@@ -1497,29 +2938,16 @@ impl CairnEngine {
         // and works when the kernel starts a listing via readdirplus and continues
         // via plain readdir (READDIRPLUS_AUTO) — both use the same cookie.
         let after_rowid = offset.saturating_sub(2).max(0);
-        // Name decryption (age, CPU-bound) runs inside this same spawn_blocking
-        // closure rather than after it, so a large hide-names listing doesn't
-        // stall the tokio async worker decrypting up to 1000 names inline.
-        let crypto = self.crypto.clone();
         let db_entries = tokio::task::spawn_blocking({
             let db = self.db.clone();
             let i = ino;
-            move || -> anyhow::Result<Vec<(i64, ResolvedName, u64, u32)>> {
-                let rows = db.list_dentries_rowid_after(i, after_rowid, 1000)?;
-                Ok(rows
-                    .into_iter()
-                    .map(|(rowid, name, name_enc, child_ino, kind)| {
-                        let display = resolve_name(&crypto, &name, name_enc.as_deref());
-                        (rowid, display, child_ino, kind)
-                    })
-                    .collect())
-            }
+            move || db.list_dentries_rowid_after(i, after_rowid, 1000)
         })
         .await
         .map_err(CairnEngine::to_eio)?
         .map_err(CairnEngine::to_eio)?;
 
-        for (rowid, display, child_ino, kind) in db_entries {
+        for (rowid, name, name_enc, child_ino, kind) in db_entries {
             // map ALL POSIX file types (same as readdirplus/mk_file_attr).
             let file_type = match kind & libc::S_IFMT {
                 libc::S_IFDIR => FileType::Directory,
@@ -1530,11 +2958,14 @@ impl CairnEngine {
                 libc::S_IFSOCK => FileType::Socket,
                 _ => FileType::RegularFile,
             };
+            // --hide-names: decrypt the real name for display (falls back to the
+            // opaque hash if the private key is absent). No-op in normal archives.
+            let display = self.resolve_dentry_name(&name, name_enc.as_deref());
             entries.push(DirectoryEntry {
                 inode: child_ino,
                 offset: rowid + 2,
                 kind: file_type,
-                name: OsStr::new(&display.into_string()).into(),
+                name: OsStr::new(&display).into(),
             });
         }
 
@@ -1631,43 +3062,28 @@ impl CairnEngine {
         // encode the same thing in the offset.
         // saturating cast prevents u64::MAX → negative i64 wrap.
         let after_rowid = i64::try_from(offset.saturating_sub(2)).unwrap_or(i64::MAX);
-        // Name decryption runs inside this closure (see readdir's comment above
-        // for why) — readdirplus is the hotter of the two, since kernels prefer
-        // it (READDIRPLUS_AUTO) over plain readdir.
-        let crypto = self.crypto.clone();
-        #[allow(clippy::type_complexity)]
         let db_entries = tokio::task::spawn_blocking({
             let db = self.db.clone();
             let i = parent;
-            move || -> anyhow::Result<
-                Vec<(i64, ResolvedName, u64, u32, u32, u32, u64, u32, i64, u32)>,
-            > {
-                let rows = db.list_dentries_rowid_after_plus(i, after_rowid, 1000)?;
-                Ok(rows
-                    .into_iter()
-                    .map(
-                        |(rowid, name, name_enc, ino, mode, uid, gid, size, nlink, mtime_sec, mtime_nsec)| {
-                            let display = resolve_name(&crypto, &name, name_enc.as_deref());
-                            (rowid, display, ino, mode, uid, gid, size, nlink, mtime_sec, mtime_nsec)
-                        },
-                    )
-                    .collect())
-            }
+            move || db.list_dentries_rowid_after_plus(i, after_rowid, 1000)
         })
         .await
         .map_err(CairnEngine::to_eio)?
         .map_err(CairnEngine::to_eio)?;
 
-        for (rowid, display, ino, mode, uid, gid, size, nlink, mtime_sec, mtime_nsec) in db_entries
+        for (rowid, name, name_enc, ino, mode, uid, gid, size, nlink, mtime_sec, mtime_nsec) in
+            db_entries
         {
             // map ALL POSIX file types, not just Dir/Symlink/Regular.
             // mk_file_attr (line 108) handles all 7 types; readdir must match.
             let kind = mode_to_filetype(mode);
+            // --hide-names: decrypt for display (no-op in normal archives).
+            let display = self.resolve_dentry_name(&name, name_enc.as_deref());
             entries.push(DirectoryEntryPlus {
                 inode: ino,
                 generation: 0,
                 kind,
-                name: OsStr::new(&display.into_string()).into(),
+                name: OsStr::new(&display).into(),
                 offset: rowid + 2,
                 attr: FileAttr {
                     ino,
@@ -1710,6 +3126,11 @@ impl CairnEngine {
         mode: u32,
         _umask: u32,
     ) -> std::io::Result<EngineReplyEntry> {
+        tracing::trace!(
+            "cairn_core::mkdir STARTED for parent {} name {:?}",
+            parent,
+            name
+        );
         let name_str = name.to_string_lossy();
         // apply the process umask to the requested mode
         // (FUSE passes the post-umask mode, so this is a no-op in the
@@ -1787,6 +3208,11 @@ impl CairnEngine {
         mode: u32,
         _rdev: u32,
     ) -> std::io::Result<EngineReplyEntry> {
+        tracing::trace!(
+            "cairn_core::mknod STARTED for parent {} name {:?}",
+            parent,
+            name
+        );
         let name_str = name.to_string_lossy();
         // keep the kernel's full mode (S_IFMT + perm + special
         // bits). The previous `S_IFREG | (mode & 0o777)` silently turned
@@ -2135,6 +3561,8 @@ impl CairnEngine {
                         self.raid_mode.clone(),
                         self.async_upload,
                         None,
+                        self.shared_dedup_write_config()
+                            .map_err(CairnEngine::to_eio)?,
                     )
                     .await
                     .map_err(CairnEngine::to_eio)?;
@@ -2162,6 +3590,22 @@ impl CairnEngine {
                     .map_err(CairnEngine::to_eio)?
                     .map_err(CairnEngine::to_eio)?;
                 }
+
+                // The authenticated snapshot tree must bind a symlink's target,
+                // not merely its mode and name.  Store the same domain-separated
+                // digest used for regular-file content before exposing the inode.
+                let mut target_hasher = crate::hashing::FileHasher::new();
+                target_hasher
+                    .update(link_bytes)
+                    .map_err(CairnEngine::to_eio)?;
+                let target_digest = target_hasher.finish().hash;
+                tokio::task::spawn_blocking({
+                    let db = self.db.clone();
+                    move || db.set_file_digest(ino, &target_digest)
+                })
+                .await
+                .map_err(CairnEngine::to_eio)?
+                .map_err(CairnEngine::to_eio)?;
 
                 // Use mk_file_attr for correct mtime and FileType decoding (was
                 // hardcoded UNIX_EPOCH + FileType::Symlink, inconsistent with
@@ -2223,8 +3667,7 @@ impl CairnEngine {
         for (hash, _, _, wrapped_key, comp_type, cipher_algo) in chunks {
             let cipher = self.fetch_chunk(&hash).await.map_err(CairnEngine::to_eio)?;
             let plain = self
-                .crypto
-                .decrypt_chunk_symmetric(&cipher, &wrapped_key, comp_type as u8, &cipher_algo)
+                .decrypt_chunk_auto(&hash, &cipher, &wrapped_key, comp_type as u8, &cipher_algo)
                 .map_err(CairnEngine::to_eio)?;
             // check length incrementally to avoid allocating gigabytes
             // before the PATH_MAX check catches a malicious symlink.
@@ -2247,6 +3690,16 @@ impl CairnEngine {
         _fh: Option<u64>,
         set_attr: SetAttr,
     ) -> std::io::Result<FileAttr> {
+        // BF-04.7: a size mutation is a read-modify-write across the pending
+        // buffer flush AND the chunk/size update; hold the per-inode write
+        // lock for the whole sequence so a concurrent write()/fsync()/release()
+        // cannot interleave between the flush and the mutation. Non-size
+        // setattr calls (chmod/chown) stay lock-free.
+        let _size_guard = if set_attr.size.is_some() {
+            Some(self.get_write_lock(ino).lock_owned().await)
+        } else {
+            None
+        };
         // Truncate must drop chunk data, not just the size field — otherwise
         // a rewrite (O_TRUNC) appends new chunks after the stale ones.
         if let Some(new_size) = set_attr.size {
@@ -2258,7 +3711,7 @@ impl CairnEngine {
             // the truncate + size update + inline clear are now in ONE tx
             // (cairn-index::truncate_inode) so a crash between the steps
             // cannot leave `size > 0` with empty chunks.
-            self.flush_pending_buffer(ino).await?;
+            self.flush_pending_buffer_locked(ino).await?;
 
             // Inline files need engine-side handling: `truncate_inode` clears
             // inline_data unconditionally (correct only for truncate-to-0), which
@@ -2334,6 +3787,16 @@ impl CairnEngine {
         {
             tracing::error!("setattr: updating inode {}: {}", ino, e);
             return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+
+        // BF-04.1: a size/content mutation invalidates the stored H09 digest.
+        // Without this, tree_root()/verify_file_digest() keep binding bytes the
+        // file no longer has after a truncate, and a snapshot's root no longer
+        // describes its frozen content.
+        if set_attr.size.is_some() {
+            self.store_file_digest(ino)
+                .await
+                .map_err(CairnEngine::to_eio)?;
         }
 
         // distinguish a genuinely-missing inode (ENOENT) from a DB read error
@@ -2415,6 +3878,9 @@ impl CairnEngine {
         }
 
         if flags & (libc::O_TRUNC as u32) != 0 {
+            // BF-04.7: same read-modify-write lock scope as setattr — flush and
+            // truncate must be atomic against concurrent writers.
+            let _trunc_guard = self.get_write_lock(ino).lock_owned().await;
             // O_TRUNC is an implicit truncate to 0: flush any pending buffer
             // first (same reason as setattr) so stale buffered bytes cannot
             // reappear, then drop all chunks + size + inline in ONE
@@ -2423,7 +3889,7 @@ impl CairnEngine {
             // was still pre-truncate; it also failed to clear `inline_data`,
             // so a backupped-then-truncated file would read as empty on the
             // mount but `extract` would still return the original bytes.
-            self.flush_pending_buffer(ino).await?;
+            self.flush_pending_buffer_locked(ino).await?;
             tokio::task::spawn_blocking({
                 let db = self.db.clone();
                 move || db.truncate_inode(ino, 0)
@@ -2434,6 +3900,10 @@ impl CairnEngine {
                 tracing::error!("open: O_TRUNC on ino {}: {}", ino, e);
                 std::io::Error::from_raw_os_error(libc::EIO)
             })?;
+            // BF-04.1: truncate-to-0 invalidates the stored digest too.
+            self.store_file_digest(ino)
+                .await
+                .map_err(CairnEngine::to_eio)?;
         }
         Ok((0, 0))
     }
@@ -2447,6 +3917,7 @@ impl CairnEngine {
         _lock_owner: u64,
         _flush: bool,
     ) -> std::io::Result<()> {
+        tracing::trace!("cairn_core::release STARTED for ino {}", _ino);
         #[cfg(feature = "cloud-storage")]
         {
             let is_write = _flags & 3 != libc::O_RDONLY as u32;
@@ -2516,6 +3987,15 @@ impl CairnEngine {
         // wanting this lock must clone the Arc through entry() under that same
         // shard lock — so strong_count == 1 proves the map holds the only Arc
         // and nobody can acquire it between the check and the removal.
+        //
+        // BF-04.7: the digest is published while the write lock is STILL held,
+        // so it cannot be computed against chunk state that a concurrent
+        // writer is mutating (a plain post-unlock store raced exactly that).
+        if flush_err.is_none() {
+            if let Err(e) = self.store_file_digest(_ino).await {
+                flush_err = Some(CairnEngine::to_eio(e));
+            }
+        }
         drop(_guard);
         drop(lock);
         self.write_locks
@@ -2524,6 +4004,8 @@ impl CairnEngine {
         if let Some(e) = flush_err {
             return Err(e);
         }
+        // H09: finalize-time whole-file digest (covers inline files that never
+        // reach the flush_range hook; idempotent for chunked files).
         Ok(())
     }
 
@@ -2565,6 +4047,9 @@ impl CairnEngine {
                 }
             }
         }
+        self.store_file_digest(_ino)
+            .await
+            .map_err(CairnEngine::to_eio)?;
         Ok(())
     }
 
@@ -2577,7 +4062,14 @@ impl CairnEngine {
     async fn flush_pending_buffer(&self, ino: u64) -> std::io::Result<()> {
         let lock = self.get_write_lock(ino);
         let _guard = lock.lock().await;
+        self.flush_pending_buffer_locked(ino).await
+    }
 
+    /// BF-04.7: the flush body without taking the per-inode lock. Callers that
+    /// must serialize a whole read-modify-write sequence (setattr truncate,
+    /// open(O_TRUNC)) hold the lock across flush AND mutation, so they cannot
+    /// use the locking wrapper above (tokio mutexes are not reentrant).
+    async fn flush_pending_buffer_locked(&self, ino: u64) -> std::io::Result<()> {
         let state_arc = self.write_buffers.get(&ino).map(|e| e.value().clone());
         if let Some(arc) = state_arc {
             let mut state = arc.lock().await;
@@ -2632,20 +4124,64 @@ impl CairnEngine {
         self.flush_pending_buffer(ino).await?;
 
         if punch_hole {
-            // Drop chunk rows in [offset, offset+length); readers will zero-fill
-            // the gap (the existing read path already zero-fills missing ranges).
-            // We model a hole as "no chunk rows here" + the inode size unchanged.
+            // BF-04.11: readers zero-fill missing ranges, so a chunk ENTIRELY
+            // inside [offset, end) can simply be dropped. A chunk that crosses
+            // either boundary must be read-modify-written instead: the old
+            // drop/shorten truncated only its head and threw away everything
+            // after it, zeroing data OUTSIDE the punched range (verified with a
+            // one-chunk file: punch [1000,2000) zeroed [2000,30000)).
             let end = offset.saturating_add(length);
-            if let Err(e) = tokio::task::spawn_blocking({
+            let rows = tokio::task::spawn_blocking({
                 let db = self.db.clone();
-                move || db.drop_file_chunks_range(ino, offset, end)
+                move || db.get_file_chunks_range(ino, offset, end)
             })
             .await
             .map_err(CairnEngine::to_eio)?
-            {
-                tracing::error!("fallocate: punch hole ino {ino}: {e}");
-                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            .map_err(CairnEngine::to_eio)?;
+
+            for (oid, row_off, row_len, wrapped, comp_type, algo) in rows {
+                let row_off = row_off as u64;
+                let row_end = row_off.saturating_add(row_len as u64);
+                if row_off >= end || row_end <= offset {
+                    continue;
+                }
+                if row_off >= offset && row_end <= end {
+                    let db = self.db.clone();
+                    let (i, s, e) = (ino, row_off, row_end);
+                    if let Err(err) =
+                        tokio::task::spawn_blocking(move || db.drop_file_chunks_range(i, s, e))
+                            .await
+                            .map_err(CairnEngine::to_eio)?
+                    {
+                        tracing::error!("fallocate: punch hole row drop ino {ino}: {err}");
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    continue;
+                }
+                // Boundary-crossing row: zero only the intersection and keep
+                // the rest. Re-chunking this span is fine — content binds.
+                let cipher = self.fetch_chunk(&oid).await.map_err(CairnEngine::to_eio)?;
+                let plain = self
+                    .decrypt_chunk_auto(&oid, &cipher, &wrapped, comp_type as u8, &algo)
+                    .map_err(CairnEngine::to_eio)?;
+                let mut data = plain
+                    .get(..row_len)
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?
+                    .to_vec();
+                let zero_from = offset.saturating_sub(row_off) as usize;
+                let zero_to = (end.min(row_end).saturating_sub(row_off)) as usize;
+                if zero_from < zero_to && zero_to <= data.len() {
+                    data[zero_from..zero_to].fill(0);
+                }
+                self.flush_range(ino, row_off, &data)
+                    .await
+                    .map_err(CairnEngine::to_eio)?;
             }
+            // BF-04.1: a punched hole zeroes a byte range, so the stored digest
+            // must be recomputed (the logical size is unchanged).
+            self.store_file_digest(ino)
+                .await
+                .map_err(CairnEngine::to_eio)?;
             return Ok(());
         }
 
@@ -2684,6 +4220,11 @@ impl CairnEngine {
                     tracing::error!("fallocate: update size ino {ino}: {e}");
                     return Err(std::io::Error::from_raw_os_error(libc::EIO));
                 }
+                // BF-04.1: growing the logical size changes the digest's
+                // size binding, so refresh it here as well.
+                self.store_file_digest(ino)
+                    .await
+                    .map_err(CairnEngine::to_eio)?;
             }
         }
         Ok(())
@@ -3095,6 +4636,1026 @@ impl CairnEngine {
         }
         applied
     }
+
+    pub async fn extract_all(&self, dest_dir: &str, preserve_metadata: bool) -> anyhow::Result<()> {
+        tokio::fs::create_dir_all(dest_dir).await?;
+
+        // A single unreadable file (a lost/corrupt chunk) must NOT abort the whole
+        // restore — the operator needs every OTHER file back. Failures are counted
+        // and surfaced at the end (non-zero exit), like `backup`.
+        let mut failures = 0u64;
+        let mut stack = vec![(1u64, dest_dir.to_string())];
+        // Hardlink recreation: maps an archive inode (nlink>1) to the first disk
+        // path it was extracted to, so additional names for the same inode are
+        // hard-linked on disk instead of written as independent copies.
+        let mut hardlink_extract: std::collections::HashMap<u64, std::path::PathBuf> =
+            std::collections::HashMap::new();
+
+        while let Some((parent_ino, current_dir)) = stack.pop() {
+            // a DB error while listing a directory must not silently
+            // drop its whole subtree from the restore. Count it as a failure (so the
+            // extract exits non-zero) and log it, while still restoring every other
+            // branch — matching this function's "count and surface, never abort" rule.
+            let dentries_result = tokio::task::spawn_blocking({
+                let db = self.db.clone();
+                let i = parent_ino;
+                move || db.list_dentries(i)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
+            if let Err(ref e) = dentries_result {
+                failures += 1;
+                tracing::error!(
+                    "extract: list_dentries failed for dir inode {parent_ino}: {e} — subtree skipped"
+                );
+            }
+            if let Ok(dentries) = dentries_result {
+                for (name_key, name_enc, ino) in dentries {
+                    // --hide-names: reconstruct the real on-disk name (falls back
+                    // to the opaque hash if the private key is absent). Normal
+                    // archives return the stored name unchanged.
+                    let name = self.resolve_dentry_name(&name_key, name_enc.as_deref());
+                    // match on both Ok/Err so DB errors are logged and
+                    // counted instead of silently skipping the child entry.
+                    let inode_result = tokio::task::spawn_blocking({
+                        let db = self.db.clone();
+                        let i = ino;
+                        move || db.get_inode(i)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
+                    let (mode, _uid, _gid, _size, nlink, _mtime_sec, _mtime_nsec) =
+                        match inode_result {
+                            Ok(Some(info)) => info,
+                            Ok(None) => {
+                                failures += 1;
+                                tracing::error!(
+                                    "extract: inode {ino} (name {name:?}) not found in DB — skipped"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                tracing::error!(
+                                    "extract: get_inode({ino}) failed for {name:?}: {e} — skipped"
+                                );
+                                continue;
+                            }
+                        };
+                    {
+                        let name_path = std::path::Path::new(&name);
+                        if name_path.is_absolute()
+                            || name_path.components().any(|c| {
+                                matches!(c, std::path::Component::ParentDir)
+                                    || matches!(c, std::path::Component::CurDir)
+                            })
+                            || name.contains('/')
+                        {
+                            continue;
+                        }
+                        let path = std::path::Path::new(&current_dir).join(&name);
+
+                        if mode & libc::S_IFMT == libc::S_IFDIR {
+                            // Materialize the directory now: children are extracted
+                            // into it, and empty directories must survive the restore.
+                            // If a symlink already exists at the path, remove it so
+                            // create_dir_all makes a real directory and children are
+                            // not written through a redirected link.
+                            if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
+                                if meta.is_symlink() {
+                                    let _ = tokio::fs::remove_file(&path).await;
+                                }
+                            }
+                            tokio::fs::create_dir_all(&path).await?;
+                            if preserve_metadata {
+                                #[cfg(unix)]
+                                {
+                                    self.apply_preserved_metadata(ino, &path).await;
+                                }
+                            }
+                            stack.push((ino, path.to_string_lossy().to_string()));
+                        } else if mode & libc::S_IFMT == libc::S_IFLNK {
+                            match self.read_file_all(ino).await {
+                                Ok(Some(target_data)) => {
+                                    let target_str = String::from_utf8_lossy(&target_data);
+                                    #[cfg(unix)]
+                                    let _ = tokio::fs::symlink(target_str.as_ref(), &path).await;
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    failures += 1;
+                                    tracing::error!(
+                                        "extract: symlink {path:?} could NOT be restored: {e}"
+                                    );
+                                    continue;
+                                }
+                            }
+                            if preserve_metadata {
+                                #[cfg(unix)]
+                                {
+                                    self.apply_preserved_metadata(ino, &path).await;
+                                }
+                            }
+                        } else {
+                            // Hardlink recreation: if this archive inode (nlink>1)
+                            // was already extracted under another name, link the new
+                            // name to that first path instead of writing a second
+                            // independent copy — this restores the on-disk link and
+                            // avoids re-decrypting the data. The shared inode already
+                            // carries mode/mtime, so skip perms/preserve here.
+                            if nlink > 1 {
+                                if let Some(first) = hardlink_extract.get(&ino).cloned() {
+                                    // Clear any stale/existing dest (re-extract case);
+                                    // hard_link fails if the target already exists.
+                                    let _ = tokio::fs::remove_file(&path).await;
+                                    match tokio::fs::hard_link(&first, &path).await {
+                                        Ok(()) => continue,
+                                        Err(e) => {
+                                            // Never lose the file — fall back to a copy.
+                                            tracing::warn!(
+                                                "extract: hard_link {path:?} -> {first:?} failed, copying: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // Regular file: stream chunk-by-chunk to disk so a multi-GB
+                            // file is never fully buffered in RAM (fix).
+                            if let Err(e) = self.extract_file_to(ino, &path).await {
+                                failures += 1;
+                                tracing::error!("extract: {path:?} could NOT be restored: {e}");
+                                continue;
+                            }
+
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                // keep setuid/setgid/sticky
+                                // bits (0o7777, not 0o777) so a backed-up
+                                // setuid binary is restored as setuid.
+                                let perm = std::fs::Permissions::from_mode(mode & 0o7777);
+                                let _ = tokio::fs::set_permissions(&path, perm).await;
+                            }
+                            if preserve_metadata {
+                                #[cfg(unix)]
+                                {
+                                    self.apply_preserved_metadata(ino, &path).await;
+                                }
+                            }
+                            // First name for this inode: remember it as the link
+                            // target for any later name that shares the inode.
+                            if nlink > 1 {
+                                hardlink_extract.insert(ino, path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if failures > 0 {
+            anyhow::bail!(
+                "{failures} file(s) could NOT be restored (see the errors above); \
+                 all other files were extracted"
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn extract_single_file(
+        &self,
+        file_path: &str,
+        dest_dir: &str,
+        preserve_metadata: bool,
+    ) -> anyhow::Result<()> {
+        let mut current_ino = 1u64;
+        let path = std::path::Path::new(file_path);
+
+        for comp in path.components() {
+            if let std::path::Component::Normal(name) = comp {
+                let name_str = name.to_string_lossy().to_string();
+                // --hide-names: resolve each path component through its lookup key.
+                let name_clone = self.crypto.name_lookup_key(current_ino, &name_str)?;
+                let child_ino = tokio::task::spawn_blocking({
+                    let db = self.db.clone();
+                    let p_ino = current_ino;
+                    move || db.get_dentry_inode(p_ino, &name_clone)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+                if let Some(ino) = child_ino {
+                    current_ino = ino;
+                } else {
+                    anyhow::bail!("Path component '{}' not found", name_str);
+                }
+            }
+        }
+
+        let is_file = tokio::task::spawn_blocking({
+            let db = self.db.clone();
+            let ino = current_ino;
+            move || db.get_inode(ino)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        .map(|(mode, ..)| mode & libc::S_IFMT == libc::S_IFREG)
+        .unwrap_or(false);
+
+        if !is_file {
+            anyhow::bail!("Path '{}' is not a regular file", file_path);
+        }
+
+        tokio::fs::create_dir_all(dest_dir).await?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Invalid file path"))?;
+        let dest_path = std::path::Path::new(dest_dir).join(file_name);
+
+        self.extract_file_to(current_ino, &dest_path).await?;
+
+        if preserve_metadata {
+            #[cfg(unix)]
+            {
+                self.apply_preserved_metadata(current_ino, &dest_path).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn extract_matching(
+        &self,
+        pattern: &str,
+        dest_dir: &str,
+        preserve_metadata: bool,
+    ) -> anyhow::Result<()> {
+        let compiled_pattern = glob::Pattern::new(pattern)?;
+        tokio::fs::create_dir_all(dest_dir).await?;
+
+        let mut stack = vec![(1u64, String::new())];
+        // Hardlink recreation (same as extract_all): archive inode (nlink>1) →
+        // first extracted disk path. Only names that match the glob are linked;
+        // if just one name of a group matches, it is written normally.
+        let mut hardlink_extract: std::collections::HashMap<u64, std::path::PathBuf> =
+            std::collections::HashMap::new();
+
+        while let Some((parent_ino, current_vpath)) = stack.pop() {
+            // a DB error listing a directory must fail the extract
+            // loudly rather than silently omitting that subtree. extract_matching
+            // has no per-file failure counter, so propagate the error (non-zero exit).
+            let dentries_result = tokio::task::spawn_blocking({
+                let db = self.db.clone();
+                let i = parent_ino;
+                move || db.list_dentries(i)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
+            if let Err(e) = &dentries_result {
+                return Err(anyhow::anyhow!(
+                    "extract: list_dentries failed for dir inode {parent_ino}: {e}"
+                ));
+            }
+            if let Ok(dentries) = dentries_result {
+                for (name_key, name_enc, ino) in dentries {
+                    // --hide-names: reconstruct the real name for glob-matching
+                    // and on-disk paths (opaque hash fallback without the priv key).
+                    let name = self.resolve_dentry_name(&name_key, name_enc.as_deref());
+                    // match on both Ok/Err so DB errors are logged and
+                    // the function fails loudly instead of silently skipping.
+                    let inode_result = tokio::task::spawn_blocking({
+                        let db = self.db.clone();
+                        let i = ino;
+                        move || db.get_inode(i)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
+                    let (mode, _uid, _gid, _size, nlink, _mtime_sec, _mtime_nsec) =
+                        match inode_result {
+                            Ok(Some(info)) => info,
+                            Ok(None) => {
+                                tracing::error!(
+                                    "extract: inode {ino} (name {name:?}) not found in DB — skipped"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "extract: get_inode({ino}) failed for {name:?}: {e}"
+                                ));
+                            }
+                        };
+                    {
+                        let name_path = std::path::Path::new(&name);
+                        if name_path.is_absolute()
+                            || name_path.components().any(|c| {
+                                matches!(c, std::path::Component::ParentDir)
+                                    || matches!(c, std::path::Component::CurDir)
+                            })
+                            || name.contains('/')
+                        {
+                            continue;
+                        }
+
+                        let new_vpath = if current_vpath.is_empty() {
+                            format!("/{}", name)
+                        } else {
+                            format!("{}/{}", current_vpath, name)
+                        };
+
+                        let ifmt = mode & libc::S_IFMT;
+                        if ifmt == libc::S_IFDIR {
+                            stack.push((ino, new_vpath));
+                        } else if ifmt == libc::S_IFLNK {
+                            // `extract_all` already restores
+                            // symlinks; `extract_matching` used to drop them
+                            // silently. A glob over a directory tree with
+                            // symlinks now extracts the symlinks.
+                            let relative_path = new_vpath.trim_start_matches('/');
+                            let dest_link_path = std::path::Path::new(dest_dir).join(relative_path);
+                            if let Some(parent) = dest_link_path.parent() {
+                                tokio::fs::create_dir_all(parent).await?;
+                            }
+                            match self.read_file_all(ino).await {
+                                Ok(Some(target_data)) => {
+                                    let target_str = String::from_utf8_lossy(&target_data);
+                                    #[cfg(unix)]
+                                    {
+                                        if let Err(e) =
+                                            tokio::fs::symlink(target_str.as_ref(), &dest_link_path)
+                                                .await
+                                        {
+                                            tracing::warn!(
+                                                "extract: symlink {dest_link_path:?} -> \
+                                                 {target_str}: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "extract: symlink {dest_link_path:?} unreadable: {e}"
+                                    );
+                                }
+                            }
+                            if preserve_metadata {
+                                #[cfg(unix)]
+                                {
+                                    self.apply_preserved_metadata(ino, &dest_link_path).await;
+                                }
+                            }
+                        } else if ifmt == libc::S_IFREG
+                            && (compiled_pattern.matches(&new_vpath)
+                                || compiled_pattern.matches(new_vpath.trim_start_matches('/')))
+                        {
+                            let relative_path = new_vpath.trim_start_matches('/');
+                            let dest_file_path = std::path::Path::new(dest_dir).join(relative_path);
+
+                            if let Some(parent) = dest_file_path.parent() {
+                                tokio::fs::create_dir_all(parent).await?;
+                            }
+
+                            // Hardlink recreation: link to the first extracted name
+                            // sharing this inode instead of writing a second copy.
+                            let mut linked = false;
+                            if nlink > 1 {
+                                if let Some(first) = hardlink_extract.get(&ino).cloned() {
+                                    let _ = tokio::fs::remove_file(&dest_file_path).await;
+                                    match tokio::fs::hard_link(&first, &dest_file_path).await {
+                                        Ok(()) => linked = true,
+                                        Err(e) => tracing::warn!(
+                                            "extract: hard_link {dest_file_path:?} -> {first:?} failed, copying: {e}"
+                                        ),
+                                    }
+                                }
+                            }
+
+                            if !linked {
+                                self.extract_file_to(ino, &dest_file_path).await?;
+
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    // keep setuid/setgid/sticky
+                                    // bits (mask 0o7777, not 0o777) so a backed-up
+                                    // setuid binary is restored as setuid.
+                                    let perm = std::fs::Permissions::from_mode(mode & 0o7777);
+                                    let _ = tokio::fs::set_permissions(&dest_file_path, perm).await;
+                                }
+                                if preserve_metadata {
+                                    #[cfg(unix)]
+                                    {
+                                        self.apply_preserved_metadata(ino, &dest_file_path).await;
+                                    }
+                                }
+                                // Remember this as the link target for later names.
+                                if nlink > 1 {
+                                    hardlink_extract.insert(ino, dest_file_path.clone());
+                                }
+                            }
+                        }
+                        // S_IFIFO / S_IFCHR / S_IFBLK / S_IFSOCK: the archive
+                        // stores them but `extract_all` would `read_file_all`
+                        // them which only makes sense for symlinks. Skip with
+                        // a warning — special files cannot be round-tripped
+                        // through a content-addressed chunk store reliably.
+                        else if matches!(
+                            ifmt,
+                            libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK
+                        ) {
+                            tracing::warn!(
+                                "extract: skipping special file at {new_vpath} \
+                                 (FIFO/CHR/BLK/SOCK cannot be reliably restored)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn read_file_all(&self, ino: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        self.read_file_all_from_db(&self.db, ino).await
+    }
+
+    /// H15: read the complete logical content of a file from the GIVEN
+    /// database (e.g. a snapshot's point-in-time copy), assembling chunks
+    /// through the shared engine store. Same placement rules as
+    /// `read_file_all` (zero-filled holes, EOF clamp).
+    pub async fn read_file_all_from_db(
+        &self,
+        db: &cairn_index::Db,
+        ino: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        // assemble the LOGICAL content over [0, size) — chunks placed by
+        // offset into a zero-filled buffer, so holes (sparse writes, truncate-
+        // extend) read as zeros, exactly like the FUSE read() path. This used
+        // to concatenate chunks in row order and ignore offsets: wrong bytes
+        // for any non-contiguous file, short for any tail hole.
+        let inode = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || db.get_inode(ino)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        let Some(inode) = inode else {
+            return Ok(None);
+        };
+        let size = usize::try_from(inode.3)
+            .map_err(|_| anyhow::anyhow!("file size {} exceeds address space", inode.3))?;
+        // `read_file_all` buffers the WHOLE file in RAM (unlike the
+        // streaming `extract_file_to`). Cap it so a caller (e.g. `Vfs::read_file`)
+        // cannot OOM the process on a multi-GiB regular file — stream via
+        // `extract_file_to` / the FUSE `read` path for large files instead.
+        const READ_FILE_ALL_MAX: usize = 256 * 1024 * 1024;
+        if size > READ_FILE_ALL_MAX {
+            anyhow::bail!(
+                "read_file_all: file is {size} bytes (> {READ_FILE_ALL_MAX} cap) — \
+                 use the streaming extract/read path for large files"
+            );
+        }
+        let mut data = vec![0u8; size];
+
+        // check inline data first (short symlink targets stored
+        // via set_inline_data), then fall back to CDC chunks.
+        let inline = tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || db.get_inline_data(ino)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        if let Some(raw) = inline {
+            let plain = self.unwrap_inline(&raw)?;
+            let n = plain.len().min(size);
+            data[..n].copy_from_slice(&plain[..n]);
+            return Ok(Some(data));
+        }
+
+        let chunks = tokio::task::spawn_blocking({
+            let db = db.clone();
+            let i = ino;
+            move || db.get_file_chunks(i)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        let engine = self.clone();
+
+        use futures::StreamExt;
+        let mut stream = futures::stream::iter(chunks)
+            .map(
+                |(hash_key, offset, plain_len, wrapped_key, comp_type, cipher_algo)| {
+                    let engine = engine.clone();
+                    async move {
+                        let cipher = engine.fetch_chunk(&hash_key).await?;
+                        let comp_type_u8 = u8::try_from(comp_type).map_err(|_| {
+                            anyhow::anyhow!("invalid comp_type for chunk {hash_key}")
+                        })?;
+                        let chunk_oid = hash_key.clone();
+                        let plain = tokio::task::spawn_blocking(move || {
+                            engine.decrypt_chunk_auto(
+                                &chunk_oid,
+                                &cipher,
+                                &wrapped_key,
+                                comp_type_u8,
+                                &cipher_algo,
+                            )
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+                        if plain.len() < plain_len {
+                            anyhow::bail!("chunk {hash_key} shorter than recorded length");
+                        }
+                        Ok::<_, anyhow::Error>((offset, plain[..plain_len].to_vec()))
+                    }
+                },
+            )
+            .buffered(16);
+
+        while let Some(res) = stream.next().await {
+            let (off, plain) = res?;
+            // Clamp to the recorded size: a chunk tail past EOF (shrinking
+            // truncate races, straddle chunks) must not grow the logical file.
+            if off >= size {
+                continue;
+            }
+            let n = plain.len().min(size - off);
+            data[off..off + n].copy_from_slice(&plain[..n]);
+        }
+        Ok(Some(data))
+    }
+
+    /// Stream a regular file's chunks straight to `path`, decrypting one chunk at a
+    /// time and writing it to disk — never buffering the whole file in RAM (fix).
+    /// Chunks arrive in offset order (`get_file_chunks` ORDER BY offset), so a plain
+    /// sequential write reproduces `read_file_all`'s concatenation exactly.
+    ///
+    /// Security: writes are performed to a temporary file in the same directory and
+    /// atomically renamed onto `path`. This eliminates the TOCTOU race where an
+    /// attacker replaces `path` with a symlink between `remove_file` and `create`.
+    pub async fn extract_file_to(&self, ino: u64, path: &std::path::Path) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // a file flagged
+        // incomplete (marker: its last backup was interrupted) is restored
+        // best-effort from whatever is COMMITTED, with a loud warning, rather than
+        // REFUSED. The original bail broke the cardinal backup-tool rule that a failed
+        // *new* backup must never make a *prior good* version unrestorable — a failed
+        // overwrite leaves the old chunks intact in the index, and bailing stranded
+        // them (the old, wholly-valid version became un-extractable). `verify` remains
+        // the strict gate that flags these files; `extract` hands back the recoverable
+        // bytes. NOTE (data-safety tradeoff): for a LARGE file whose overwrite failed
+        // mid-flush the committed state can be MIXED (some new + some old chunks); this
+        // restores it with only the warning below — `verify` is what catches it.
+        let incomplete = tokio::task::spawn_blocking({
+            let db = self.db.clone();
+            move || db.is_file_incomplete(ino)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+        .unwrap_or(false);
+        if incomplete {
+            tracing::warn!(
+                "extract: ino {ino} is flagged incomplete (its last backup was interrupted) — \
+                 restoring committed data best-effort; run `verify`, and re-run `backup` to be safe"
+            );
+        }
+
+        let path_buf = path.to_path_buf();
+        let parent = path_buf
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("extract path has no parent: {path_buf:?}"))?
+            .to_path_buf();
+
+        // the extracted file must be exactly `size` bytes — a tail hole
+        // (sparse write / truncate-extend) used to yield a SHORT file because
+        // nothing wrote past the last chunk. `set_len(size)` below pads the
+        // tail with zeros (and defensively clamps anything past EOF), matching
+        // the FUSE read() view of the same inode.
+        let recorded_size = tokio::task::spawn_blocking({
+            let db = self.db.clone();
+            move || db.get_inode(ino)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
+        .ok_or_else(|| anyhow::anyhow!("extract: inode {ino} not found"))?
+        .3;
+
+        // Create a temporary file in the destination directory. `tempfile` places it
+        // on the same filesystem, so the final `persist` is an atomic rename.
+        let tmp = tokio::task::spawn_blocking({
+            let p = parent.clone();
+            move || {
+                tempfile::NamedTempFile::new_in(&p)
+                    .map_err(|e| anyhow::anyhow!("failed to create temp file in {p:?}: {e}"))
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+        // propagate a DB read error rather than extracting an empty file.
+        if let Some(raw_inline) = self.db.get_inline_data(ino)? {
+            let inline_data = self.unwrap_inline(&raw_inline)?;
+            let mut file = tokio::fs::File::from_std(tmp.as_file().try_clone()?);
+            file.write_all(&inline_data).await?;
+            file.set_len(recorded_size).await?;
+            drop(file);
+            tokio::task::spawn_blocking(move || {
+                tmp.persist(&path_buf)
+                    .map_err(|e| anyhow::anyhow!("failed to rename temp file to {path_buf:?}: {e}"))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+            return Ok(());
+        }
+
+        let chunks = tokio::task::spawn_blocking({
+            let db = self.db.clone();
+            let i = ino;
+            move || db.get_file_chunks(i)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+        let mut file = tokio::fs::File::from_std(tmp.as_file().try_clone()?);
+        let engine = self.clone();
+
+        use futures::StreamExt;
+        let mut stream = futures::stream::iter(chunks)
+            .map(
+                |(hash_key, offset, plain_len, wrapped_key, comp_type, cipher_algo)| {
+                    let engine = engine.clone();
+                    async move {
+                        let cipher = engine.fetch_chunk(&hash_key).await?;
+                        let comp_type_u8 = u8::try_from(comp_type).map_err(|_| {
+                            anyhow::anyhow!("invalid comp_type for chunk {hash_key}")
+                        })?;
+                        let chunk_oid = hash_key.clone();
+                        let plain = tokio::task::spawn_blocking(move || {
+                            engine.decrypt_chunk_auto(
+                                &chunk_oid,
+                                &cipher,
+                                &wrapped_key,
+                                comp_type_u8,
+                                &cipher_algo,
+                            )
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+                        if plain.len() < plain_len {
+                            anyhow::bail!("chunk {hash_key} shorter than recorded length");
+                        }
+                        Ok::<_, anyhow::Error>((offset, plain[..plain_len].to_vec()))
+                    }
+                },
+            )
+            .buffer_unordered(
+                std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
+            );
+
+        use tokio::io::AsyncSeekExt;
+        while let Some(res) = stream.next().await {
+            let (offset, data) = res?;
+            let offset_u64 =
+                u64::try_from(offset).map_err(|_| anyhow::anyhow!("chunk offset exceeds u64"))?;
+            file.seek(std::io::SeekFrom::Start(offset_u64)).await?;
+            file.write_all(&data).await?;
+        }
+        file.set_len(recorded_size).await?;
+        drop(file);
+
+        tokio::task::spawn_blocking(move || {
+            tmp.persist(&path_buf)
+                .map_err(|e| anyhow::anyhow!("failed to rename temp file to {path_buf:?}: {e}"))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+        Ok(())
+    }
+
+    pub async fn gc(&self, grace_period_hours: u64) -> anyhow::Result<(usize, usize)> {
+        // prevent concurrent GC runs — a second GC during an active one
+        // would see a partially-deleted index and double-delete or orphan chunks.
+        let _gc_guard = self
+            .gc_running
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("GC is already running (concurrent GC not supported)"))?;
+        // `get_orphaned_chunks` excludes chunks referenced by the LIVE tree
+        // (file_chunks) but is blind to snapshots — their chunks live inside blob
+        // DBs, not queryable in SQL. Without this second filter, gc deletes chunks
+        // that only a snapshot references, silently bricking that snapshot's
+        // restore. `get_all_used_chunks` opens every snapshot and ERRORS on a
+        // corrupt one, so gc fails safe rather than deleting what it can't verify.
+        //
+        // the used/orphan queries are not one transaction, but the
+        // `grace_period_hours` filter in `get_orphaned_chunks` is the race guard:
+        // a chunk a concurrent flush just wrote is younger than the grace window,
+        // so it is never an orphan candidate. Only `--grace-period-hours 0`
+        // removes this protection — do not run gc with grace 0 against a live
+        // mount (OPERATING recommends 24h).
+        let used = self.db.get_all_used_chunks()?;
+        let orphaned: Vec<String> = self
+            .db
+            .get_orphaned_chunks(grace_period_hours)?
+            .into_iter()
+            .filter(|h| !used.contains(h))
+            .collect();
+        let mut total_removed = 0;
+
+        let gc_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        #[cfg_attr(not(feature = "cloud-storage"), allow(unused_mut))]
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        for hash_key in orphaned {
+            let cache_dir = self.cache_dir.clone();
+            let sem = gc_sem.clone();
+            let db = self.db.clone();
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("GC semaphore closed: {e}"))?;
+            // Remove the index row FIRST. The failure modes are asymmetric: an
+            // orphaned blob (row gone, delete below fails) merely leaks storage
+            // and the local sweep reclaims it, while a dangling row (data gone,
+            // row removal fails) turns into EIO at read time.
+            if let Err(e) = db.remove_chunk_from_index(&hash_key) {
+                tracing::error!(
+                    "gc: failed to remove {hash_key} from index: {e} — leaving its data in place"
+                );
+                drop(_permit);
+                continue;
+            }
+            let _ = cacache::remove(&cache_dir, &hash_key).await;
+            #[cfg(feature = "cloud-storage")]
+            {
+                let s3_path = format!("chunks/{hash_key}");
+                let ops = self.operators.clone();
+                let sem2 = gc_sem.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem2.acquire().await;
+                    for op in &ops {
+                        let _ = op.delete(&s3_path).await;
+                    }
+                    drop(_permit);
+                }));
+            }
+            total_removed += 1;
+            drop(_permit);
+        }
+        futures::future::join_all(handles).await;
+
+        // Also clean up any lingering local cacache blobs that aren't referenced
+        // anywhere. The protected set is used_chunks (file_chunks + snapshots)
+        // UNION all chunk_index rows: a chunk still in the index is either in
+        // active use or inside the grace window (orphaned but not yet
+        // collectable). The old sweep used only `used_chunks`, so a grace-period
+        // orphan's local blob was deleted while its index row survived — and the
+        // next dedup hit on the same content found the row but no blob → `EIO`
+        // on local-only archives.
+        let mut local_orphans = 0;
+        let mut protected = self.db.get_all_used_chunks()?;
+        protected.extend(self.db.get_all_indexed_chunk_objects()?);
+        for entry in cacache::list_sync(&self.cache_dir).flatten() {
+            if !protected.contains(&entry.key) {
+                let _ = cacache::remove(&self.cache_dir, &entry.key).await;
+                local_orphans += 1;
+            }
+        }
+
+        tracing::info!(
+            "Garbage Collection complete: removed {} orphaned chunks globally, and {} local cache orphans",
+            total_removed,
+            local_orphans
+        );
+        Ok((total_removed, local_orphans))
+    }
+
+    /// Per-FILE integrity check: proves every file is actually restorable, which
+    /// `scrub` does NOT — scrub verifies chunks exist and hash-match, but a file
+    /// with a dangling chunk reference or a recorded size that no chunks back
+    /// (the class: "size set, zero data") passes scrub and fails here.
+    ///
+    /// For each regular file it fetches and DECRYPTS every chunk (so it needs the
+    /// read key — this measures restorability, not just presence), streaming one
+    /// chunk at a time, and checks the decrypted total equals the recorded size.
+    /// Returns `(ok, bad)` and logs each bad file with the reason.
+    pub async fn verify_all(&self) -> anyhow::Result<(usize, usize)> {
+        let files = tokio::task::spawn_blocking({
+            let db = self.db.clone();
+            move || db.list_regular_files()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+        // files whose backup was interrupted (killed mid-write) carry a
+        // durable marker. Their committed size is self-consistent with the
+        // chunks actually written, so verify_one would pass them — but the file
+        // is truncated. Treat any marked inode as NOT restorable.
+        let incomplete: std::collections::HashSet<u64> = tokio::task::spawn_blocking({
+            let db = self.db.clone();
+            move || db.list_incomplete_files()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+        let mut ok = 0usize;
+        let mut bad = 0usize;
+
+        for (ino, size) in files {
+            if incomplete.contains(&ino) {
+                bad += 1;
+                let name = self
+                    .db
+                    .get_inode_name(ino)
+                    .unwrap_or_else(|_| format!("ino {ino}"));
+                tracing::error!(
+                    "verify: {name} (ino {ino}) is NOT restorable: backup was interrupted \
+                     (killed mid-file) — the file is truncated. Re-run backup to complete it."
+                );
+                continue;
+            }
+            match self.verify_one(ino, size).await {
+                Ok(()) => ok += 1,
+                Err(e) => {
+                    bad += 1;
+                    let name = self
+                        .db
+                        .get_inode_name(ino)
+                        .unwrap_or_else(|_| format!("ino {ino}"));
+                    tracing::error!("verify: {name} (ino {ino}) is NOT restorable: {e}");
+                }
+            }
+        }
+
+        if bad > 0 {
+            tracing::error!("verify: {ok} file(s) OK, {bad} file(s) NOT restorable");
+        } else {
+            tracing::info!("verify: all {ok} file(s) restorable");
+        }
+        Ok((ok, bad))
+    }
+
+    async fn verify_one(&self, ino: u64, size: u64) -> anyhow::Result<()> {
+        // Inline files: the bytes are in the index, no chunks to resolve.
+        // propagate a DB read error — verify must not silently treat an
+        // unreadable inode as "0-byte / no inline" and PASS it as restorable.
+        if let Some(raw) = self.db.get_inline_data(ino)? {
+            // Decrypt so the size check is against the PLAINTEXT length (the
+            // stored blob is now envelope ciphertext). Also proves the inline
+            // content is actually recoverable with the current key.
+            // inline may be SHORTER than the recorded size — a truncate-
+            // extended inline file has a legitimate zero tail (read() zero-fills
+            // it). Only inline LONGER than the size is an inconsistency.
+            let inline = self.unwrap_inline(&raw)?;
+            if inline.len() as u64 > size {
+                anyhow::bail!("inline size {} > recorded {size}", inline.len());
+            }
+            return Ok(());
+        }
+
+        let chunks = tokio::task::spawn_blocking({
+            let db = self.db.clone();
+            move || db.get_file_chunks(ino)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+
+        // Empty file: legitimately zero chunks. A non-empty file with none is the
+        // V-15 footprint (size recorded, data never flushed).
+        if chunks.is_empty() {
+            if size == 0 {
+                return Ok(());
+            }
+            anyhow::bail!("recorded size {size} but no chunks (data was never stored)");
+        }
+
+        for (hash_key, _offset, plain_len, wrapped_key, comp_type, cipher_algo) in chunks {
+            let cipher = self
+                .fetch_chunk(&hash_key)
+                .await
+                .map_err(|e| anyhow::anyhow!("chunk {hash_key} unreadable: {e}"))?;
+            let engine = self.clone();
+            let chunk_oid = hash_key.clone();
+            let plain = tokio::task::spawn_blocking(move || {
+                engine.decrypt_chunk_auto(
+                    &chunk_oid,
+                    &cipher,
+                    &wrapped_key,
+                    comp_type as u8,
+                    &cipher_algo,
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("chunk {hash_key} does not decrypt: {e}"))?;
+            if plain.len() < plain_len {
+                anyhow::bail!(
+                    "chunk {hash_key} decrypted to {} bytes < recorded {plain_len}",
+                    plain.len()
+                );
+            }
+        }
+
+        // no under-coverage check — coverage gaps (middle or tail holes)
+        // are LEGITIMATE zeros from sparse writes / truncate-extend, and read()/
+        // extract now reproduce them as zeros. (The old `sum(plain_len) < size`
+        // test was double-counting overlapping RMW chunks anyway.) The V-15
+        // "size recorded but data never flushed" footprint is still caught above:
+        // a non-empty file with ZERO chunks and no inline fails loudly.
+        Ok(())
+    }
+
+    pub async fn scrub(&self) -> anyhow::Result<(usize, usize)> {
+        // Iterate distinct chunk objects, not `file_chunks` rows: a chunk shared
+        // by many files (the dedup case) was previously verified once per
+        // reference — N times the work, N times the bandwidth on cloud reads.
+        let chunks = self.db.get_all_distinct_chunk_objects()?;
+        let mut corrupted = 0;
+        let mut verified = 0;
+
+        // Scrub verifies the durable copy. With cloud backends configured, force
+        // a cloud read (bypass the local cache) and heal from redundancy — unless
+        // the operator already set force_remote_read (same intent). On a
+        // LOCAL-ONLY archive the cache IS the durable store — forcing a cloud
+        // read there fails every fetch and reports a healthy archive as 100%
+        // corrupt (masked until made scrub's exit code authoritative).
+        let has_cloud = !self.operators.is_empty();
+        let force_remote = self.force_remote_read || has_cloud;
+
+        for hash_key in chunks {
+            if let Ok(cipher) = self
+                .store
+                .fetch_chunk(&hash_key, &self.raid_mode, false, has_cloud, force_remote)
+                .await
+            {
+                let actual_hash = blake3::hash(&cipher).to_hex().to_string();
+                if actual_hash == hash_key {
+                    verified += 1;
+                } else {
+                    // Report which files reference the corrupted chunk so the
+                    // operator can assess impact and prioritise recovery.
+                    let affected = self
+                        .db
+                        .get_inodes_using_chunk(&hash_key)
+                        .unwrap_or_default();
+                    let file_names: Vec<String> = affected
+                        .iter()
+                        .map(|ino| {
+                            self.db
+                                .get_inode_name(*ino)
+                                .unwrap_or_else(|_| format!("ino {ino}"))
+                        })
+                        .collect();
+                    tracing::error!(
+                        "Corrupted chunk detected (hash mismatch): {} — affects {} file(s): {:?}",
+                        hash_key,
+                        file_names.len(),
+                        file_names
+                    );
+                    corrupted += 1;
+                }
+            } else {
+                let affected = self
+                    .db
+                    .get_inodes_using_chunk(&hash_key)
+                    .unwrap_or_default();
+                let file_names: Vec<String> = affected
+                    .iter()
+                    .map(|ino| {
+                        self.db
+                            .get_inode_name(*ino)
+                            .unwrap_or_else(|_| format!("ino {ino}"))
+                    })
+                    .collect();
+                tracing::error!(
+                    "Missing chunk detected: {} — affects {} file(s): {:?}",
+                    hash_key,
+                    file_names.len(),
+                    file_names
+                );
+                corrupted += 1;
+            }
+        }
+
+        if corrupted > 0 {
+            tracing::error!(
+                "Scrub complete: {} chunks verified, {} corrupted/missing!",
+                verified,
+                corrupted
+            );
+        } else {
+            tracing::info!(
+                "Scrub complete: {} chunks verified successfully. No corruption detected.",
+                verified
+            );
+        }
+
+        Ok((verified, corrupted))
+    }
 }
 
 #[cfg(test)]
@@ -3119,5 +5680,45 @@ mod tests {
     fn test_to_eio() {
         let err = CairnEngine::to_eio("test error");
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+
+    // BF-04.9: the checkpoint lock itself must exclude concurrent holders and
+    // be released on drop. This is the deterministic half of the fix; the
+    // engine-level concurrent test is a stress guard on top of it.
+    #[test]
+    fn checkpoint_lock_excludes_concurrent_holders_and_releases_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cp = dir.path().join("c.checkpoint");
+        let inside = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_inside = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cp = cp.clone();
+            let inside = inside.clone();
+            let max_inside = max_inside.clone();
+            handles.push(std::thread::spawn(move || {
+                let _lock = CheckpointLock::acquire(&cp).unwrap();
+                let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                max_inside.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                inside.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            max_inside.load(Ordering::SeqCst),
+            1,
+            "checkpoint lock allowed two concurrent holders"
+        );
+
+        // Released on drop: a fresh acquire must not block.
+        let again = CheckpointLock::acquire(&cp).unwrap();
+        drop(again);
+        assert!(cp.with_file_name("c.checkpoint.lock").exists());
     }
 }

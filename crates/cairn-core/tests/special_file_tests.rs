@@ -239,7 +239,7 @@ async fn test_mknod_char_device_type() {
     );
 }
 
-// generate_chunk_key returns Result
+// keyed content IDs reject invalid dedup configuration
 #[test]
 fn test_short_dedup_secret_returns_error_not_panic() {
     use age::secrecy::ExposeSecret;
@@ -264,14 +264,14 @@ fn test_short_dedup_secret_returns_error_not_panic() {
     )
     .unwrap();
 
-    let result = ctx.generate_chunk_key(b"test");
+    let result = ctx.content_id(b"test");
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("dedup_secret must be at least 32 bytes"));
 }
 
 #[test]
-fn test_generate_chunk_key_returns_zeroizing() {
+fn test_content_id_is_deterministic_and_not_an_encryption_key() {
     use cairn_seal::CryptoCtx;
     let dir = tempfile::tempdir().unwrap();
     let pub_path = dir.path().join("pub.pem");
@@ -291,16 +291,16 @@ fn test_generate_chunk_key_returns_zeroizing() {
     )
     .unwrap();
 
-    let key = ctx.generate_chunk_key(b"test data").unwrap();
-    assert_eq!(key.len(), 32);
+    let id = ctx.content_id(b"test data").unwrap().unwrap();
+    assert_eq!(id.len(), 32);
 
     // Same input → same key (deterministic dedup)
-    let key2 = ctx.generate_chunk_key(b"test data").unwrap();
-    assert_eq!(*key, *key2);
+    let id2 = ctx.content_id(b"test data").unwrap().unwrap();
+    assert_eq!(id, id2);
 
     // Different input → different key
-    let key3 = ctx.generate_chunk_key(b"other data").unwrap();
-    assert_ne!(*key, *key3);
+    let id3 = ctx.content_id(b"other data").unwrap().unwrap();
+    assert_ne!(id, id3);
 }
 
 // SQL injection validation

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use secrecy::{ExposeSecret, SecretString};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -67,6 +67,10 @@ impl From<r2d2::Error> for XattrError {
 pub type InodeInfo = (u32, u32, u32, u64, u32, i64, u32);
 pub type FileChunkData = (String, usize, usize, Vec<u8>, i32, String);
 
+/// (name, inode_id, mode, node_hash) of one child, sorted by name — the unit
+/// an H15 Merkle inclusion chain walks level by level.
+pub type ChildNode = (String, u64, u32, [u8; 32]);
+
 /// (name_key, name_enc, inode). `name_key` = plaintext name (normal) or hex keyed-hash
 /// (hide-names); `name_enc` = age-encrypted real name, `Some` only in hide-names archives.
 pub type Dentry = (String, Option<Vec<u8>>, u64);
@@ -90,14 +94,17 @@ pub type DentryRowidPlus = (
 /// Apply SQLCipher cipher parameters and key a connection using sqlite3_key_v2 FFI.
 /// checks the return value of sqlite3_key_v2.
 /// used for ALL connection types (pool, snapshot temp, restore) for consistency.
+///
+/// BF-04.12: `PRAGMA kdf_iter` must be issued AFTER keying — SQLCipher 4.5
+/// silently ignores it when set before `key` (verified: a pragma-before-key
+/// archive and one with no pragma at all were both keyed with the default
+/// 256 000 iterations; a pragma-after-key archive opens in ~0.6 ms vs ~111 ms
+/// and rejects the default-KDF open). The old order made `CAIRN_KDF_ITER` /
+/// `--db-kdf-iter` cosmetic. `cipher_compatibility` may precede keying.
 #[allow(unsafe_code)]
 fn apply_cipher_key(conn: &Connection, pwd: &SecretString, kdf_iter: u32) -> Result<()> {
     // Cipher PRAGMAs must precede PRAGMA key or they have no effect on the KDF.
-    // kdf_iter is caller-controlled (256000 in production; lowered for tests).
-    conn.execute_batch(&format!(
-        "PRAGMA cipher_compatibility = 4;
-         PRAGMA kdf_iter = {kdf_iter};"
-    ))?;
+    conn.execute_batch("PRAGMA cipher_compatibility = 4;")?;
     let passphrase = pwd.expose_secret();
     let ptr = passphrase.as_ptr() as *const std::os::raw::c_void;
     #[allow(clippy::cast_possible_truncation)]
@@ -108,6 +115,7 @@ fn apply_cipher_key(conn: &Connection, pwd: &SecretString, kdf_iter: u32) -> Res
             "sqlite3_key_v2 failed with code {rc} (keying failure detected)"
         ));
     }
+    conn.execute_batch(&format!("PRAGMA kdf_iter = {kdf_iter};"))?;
     Ok(())
 }
 
@@ -139,13 +147,60 @@ pub struct Db {
     kdf_iter: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct SnapshotHistory {
+    pub archive_id: String,
+    pub revision: u64,
+    pub snapshots: Vec<(u64, String, u64)>,
+}
+
+impl Db {
+    /// the archive password, exposed so tooling can open restored
+    /// snapshot databases with the SAME credentials (H15 partial restore).
+    pub fn password(&self) -> Option<&SecretString> {
+        self.pwd.as_ref()
+    }
+
+    pub fn kdf_iter(&self) -> u32 {
+        self.kdf_iter
+    }
+
+    fn snapshot_revision(tx: &rusqlite::Transaction<'_>) -> Result<u64> {
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value FROM config WHERE key='snapshot_history_revision'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match raw {
+            None => Ok(0),
+            Some(value) => value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid snapshot_history_revision")),
+        }
+    }
+
+    fn bump_snapshot_revision(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        let next = Self::snapshot_revision(tx)?
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("snapshot history revision overflow"))?;
+        tx.execute(
+            "INSERT INTO config(key,value) VALUES('snapshot_history_revision',?1) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [next.to_string()],
+        )?;
+        Ok(())
+    }
+}
+
 /// Tunable SQLite/SQLCipher pool parameters. All have safe back-compat defaults
 /// (see [`DbTuning::default`]); pass a customized copy to [`Db::new_with_tuning`].
 ///
 /// - `max_connections`: r2d2 pool cap. Each open connection reserves its own
 ///   SQLite page cache (`cache_size_kb`) and `mmap_size_kb` reservation, so
 ///   worst-case resident memory is roughly `max_connections * (cache_size_kb +
-///   mmap_size_kb)` — lower either on constrained hosts (32 × 64 MiB
+///   mmap_size_kb)` — lower either on constrained hosts (V-23: 32 × 64 MiB
 ///   ≈ 2 GiB worst case).
 /// - `cache_size_kb`: per-connection page cache in KiB (negative value passed
 ///   to `PRAGMA cache_size`, the SQLite KiB form). Larger = faster reads, more
@@ -297,6 +352,30 @@ pub enum XattrFlag {
     Replace,
 }
 
+/// H10: Merkle root of a level; odd nodes duplicate the last; empty → fixed key.
+fn merkle_hashes(hashes: &[[u8; 32]]) -> [u8; 32] {
+    if hashes.is_empty() {
+        return blake3::derive_key("cairn snapshot empty v1", b"");
+    }
+    let mut level: Vec<[u8; 32]> = hashes.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let (l, r) = match pair {
+                [l, r] => (*l, *r),
+                [only] => (*only, *only),
+                _ => unreachable!(),
+            };
+            let mut h = blake3::Hasher::new_derive_key("cairn snapshot node v1");
+            h.update(&l);
+            h.update(&r);
+            next.push(*h.finalize().as_bytes());
+        }
+        level = next;
+    }
+    level[0]
+}
+
 impl Db {
     pub fn new(path: &str, password: Option<&SecretString>) -> Result<Self> {
         Self::new_with_tuning(path, password, &DbTuning::default())
@@ -318,44 +397,68 @@ impl Db {
         } else {
             std::sync::Arc::new(std::sync::Mutex::new(None))
         };
+        // fail FAST and CLEARLY on a password/archive mismatch. Without
+        // this probe a wrong password — or a password given for an archive
+        // created without one, or a mismatched CAIRN_KDF_ITER — made every
+        // pooled connection fail "file is not a database", and the caller only
+        // saw a generic pool timeout after ~connection_timeout_secs of retries.
+        //
+        // BF-04.12: the probe also decides the EFFECTIVE kdf_iter. Archives
+        // created before the pragma-order fix were always keyed with the
+        // SQLCipher default 256 000, whatever CAIRN_KDF_ITER said; they must
+        // keep opening, and every later connection (snapshot copies, restore)
+        // must use the effective value, not the configured-but-ignored one.
+        let mut effective_kdf = tuning.kdf_iter;
+        if std::fs::metadata(path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            let probe_ok = |kdf: u32| -> bool {
+                let Ok(conn) = Connection::open(path) else {
+                    return false;
+                };
+                if let Some(pwd) = password {
+                    if apply_cipher_key(&conn, pwd, kdf).is_err() {
+                        return false;
+                    }
+                }
+                conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .is_ok()
+            };
+            if !probe_ok(tuning.kdf_iter) {
+                if tuning.kdf_iter != 256_000 && password.is_some() && probe_ok(256_000) {
+                    tracing::warn!(
+                        "archive '{path}': configured kdf_iter {} does not match the file; it \
+                         was keyed with the SQLCipher default 256000 (created before the \
+                         kdf_iter order fix). Using 256000 for all connections.",
+                        tuning.kdf_iter
+                    );
+                    effective_kdf = 256_000;
+                } else if password.is_some() {
+                    anyhow::bail!(
+                        "Cannot decrypt archive '{path}': wrong password, a mismatched \
+                         CAIRN_KDF_ITER, or the archive was created WITHOUT a password \
+                         (then omit the password entirely)."
+                    );
+                } else {
+                    anyhow::bail!(
+                        "Archive '{path}' is not readable without a password — it appears to be \
+                         encrypted. Pass --password, --password-file or set CAIRN_PASSWORD."
+                    );
+                }
+            }
+        }
+
         let customizer = SqlcipherCustomizer {
             key: shared_key,
             cache_size_kb: tuning.cache_size_kb,
             mmap_size_kb: tuning.mmap_size_kb,
             synchronous: tuning.synchronous.clone(),
             busy_timeout_ms: tuning.busy_timeout_ms,
-            kdf_iter: tuning.kdf_iter,
+            kdf_iter: effective_kdf,
         };
-
-        // fail FAST and CLEARLY on a password/archive mismatch. Without
-        // this probe a wrong password — or a password given for an archive
-        // created without one, or a mismatched CAIRN_KDF_ITER — made every
-        // pooled connection fail "file is not a database", and the caller only
-        // saw a generic pool timeout after ~connection_timeout_secs of retries.
-        if std::fs::metadata(path)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
-        {
-            let probe = Connection::open(path)?;
-            if let Some(pwd) = password {
-                apply_cipher_key(&probe, pwd, tuning.kdf_iter)?;
-            }
-            let probe_result: std::result::Result<i64, rusqlite::Error> =
-                probe.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0));
-            if probe_result.is_err() {
-                if password.is_some() {
-                    anyhow::bail!(
-                        "Cannot decrypt archive '{path}': wrong password, a mismatched \
-                         CAIRN_KDF_ITER, or the archive was created WITHOUT a password \
-                         (then omit the password entirely)."
-                    );
-                }
-                anyhow::bail!(
-                    "Archive '{path}' is not readable without a password — it appears to be \
-                     encrypted. Pass --password, --password-file or set CAIRN_PASSWORD."
-                );
-            }
-        }
 
         // an unbounded `pool.get()` blocks the FUSE thread forever if
         // all connections are stuck in long-running transactions (e.g. a slow
@@ -412,22 +515,6 @@ impl Db {
             );
         }
         if existing_version < CURRENT_SCHEMA_VERSION {
-            // Migration v1 -> v2: add name_enc column for --hide-names support.
-            // Only needed for existing v1 databases where the dentries table was
-            // created without the column. New databases (version 0) already have
-            // name_enc in the CREATE TABLE statement, so this is a no-op.
-            if existing_version == 1 {
-                let has_col: bool = conn
-                    .prepare("SELECT name FROM pragma_table_info('dentries') WHERE name = 'name_enc'")
-                    .and_then(|mut s| s.exists([]))
-                    .unwrap_or(false);
-                if has_col {
-                    tracing::info!("dentries already has name_enc column -- skipping v1->v2 migration");
-                } else {
-                    tracing::info!("migrating dentries schema v1 -> v2 (add name_enc column)");
-                    conn.execute_batch("ALTER TABLE dentries ADD COLUMN name_enc BLOB")?;
-                }
-            }
             conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))?;
         }
         conn.execute_batch(
@@ -444,7 +531,8 @@ impl Db {
                 rdev INTEGER NOT NULL,
                 inline_data BLOB DEFAULT NULL,
                 ctime_sec INTEGER NOT NULL DEFAULT 0,
-                ctime_nsec INTEGER NOT NULL DEFAULT 0
+                ctime_nsec INTEGER NOT NULL DEFAULT 0,
+                file_digest BLOB DEFAULT NULL
             );
 
             CREATE TABLE IF NOT EXISTS dentries (
@@ -489,6 +577,7 @@ impl Db {
                 sym_key BLOB NOT NULL,
                 comp_type INTEGER NOT NULL DEFAULT 0,
                 cipher TEXT NOT NULL DEFAULT 'aes256gcm',
+                domain INTEGER NOT NULL DEFAULT 0,
                 last_accessed INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             );
@@ -511,7 +600,21 @@ impl Db {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 timestamp INTEGER NOT NULL,
-                db_data BLOB NOT NULL
+                db_data BLOB NOT NULL,
+                tree_root BLOB DEFAULT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshot_controls (
+                snapshot_id INTEGER PRIMARY KEY,
+                protected INTEGER NOT NULL DEFAULT 0,
+                tags_json TEXT NOT NULL DEFAULT '[]'
+            );
+
+            CREATE TABLE IF NOT EXISTS snapshot_operations (
+                operation_id TEXT PRIMARY KEY,
+                archive_id TEXT NOT NULL,
+                plan_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS config (
@@ -556,7 +659,9 @@ impl Db {
         Ok(Self {
             pool,
             pwd: password.cloned(),
-            kdf_iter: tuning.kdf_iter,
+            // BF-04.12: the EFFECTIVE value, which equals tuning.kdf_iter except
+            // for legacy archives that were keyed with the SQLCipher default.
+            kdf_iter: effective_kdf,
         })
     }
 
@@ -972,21 +1077,6 @@ impl Db {
         }
     }
 
-    /// `get_inode_name` plus the `name_enc` blob, so a caller with a `CryptoCtx`
-    /// can resolve a hide-names archive's lookup-key hash to the real name
-    /// instead of displaying/logging the hash (`get_inode_name` alone cannot do
-    /// this — it has no crypto context and only ever sees the lookup column).
-    pub fn get_inode_name_enc(&self, inode: u64) -> Result<(String, Option<Vec<u8>>)> {
-        let conn = self.pool.get()?;
-        let mut stmt =
-            conn.prepare("SELECT name, name_enc FROM dentries WHERE inode_id = ?1 LIMIT 1")?;
-        match stmt.query_row(rusqlite::params![inode], |row| Ok((row.get(0)?, row.get(1)?))) {
-            Ok(pair) => Ok(pair),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((String::new(), None)),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn insert_chunk_indices_batch(
         &self,
@@ -1020,6 +1110,46 @@ impl Db {
         match res {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// D03: mark `object_id` as a SHARED-DOMAIN chunk (its `sym_key` is the
+    /// domain-wrapped sealed record; reads must use the domain decryption
+    /// path instead of decrypt_chunk_symmetric).
+    pub fn set_chunk_domain(&self, object_id: &str, domain: bool) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE chunk_index SET domain = ?1 WHERE object_id = ?2",
+            rusqlite::params![domain as i64, object_id],
+        )?;
+        Ok(())
+    }
+
+    /// L01.3: true when `chunk_index` has a row for `object_id` (i.e. the
+    /// file_chunks → chunk_index pointer resolves).  Used to verify snapshot
+    /// self-consistency under concurrent writes.
+    pub fn chunk_exists(&self, object_id: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let res = conn.query_row(
+            "SELECT COUNT(*) FROM chunk_index WHERE object_id = ?1",
+            rusqlite::params![object_id],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(res > 0)
+    }
+
+    /// D03: read the per-chunk domain flag; absent chunk → false.
+    pub fn get_chunk_domain(&self, object_id: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let res = conn.query_row(
+            "SELECT domain FROM chunk_index WHERE object_id = ?1",
+            rusqlite::params![object_id],
+            |r| r.get::<_, i64>(0),
+        );
+        match res {
+            Ok(v) => Ok(v != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
@@ -1161,6 +1291,30 @@ impl Db {
         Ok(chunks)
     }
 
+    /// H12: every object_id this archive references (chunk_index rows) — the
+    /// durability expectation set for an inventory/scrub.
+    pub fn list_all_object_hashes(&self) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT object_id FROM chunk_index")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// H14: sum of stored (compressed-plaintext) sizes over every chunk_index
+    /// row — the naive "stored without dedup accounting" figure.
+    pub fn total_plain_bytes(&self) -> Result<u64> {
+        let conn = self.pool.get()?;
+        let n: Option<i64> =
+            conn.query_row("SELECT SUM(plain_len) FROM file_chunks", [], |row| {
+                row.get(0)
+            })?;
+        Ok(n.unwrap_or(0) as u64)
+    }
+
     pub fn get_orphaned_chunks(&self, grace_period_hours: u64) -> Result<Vec<String>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
@@ -1168,7 +1322,8 @@ impl Db {
              FROM chunk_index c 
              LEFT JOIN file_chunks f ON c.object_id = f.object_id 
              WHERE f.object_id IS NULL 
-               AND (strftime('%s', 'now') - c.created_at) > ?1",
+               AND (strftime('%s', 'now') - c.created_at) > ?1
+               AND c.object_id NOT IN (SELECT hash_key FROM upload_queue)",
         )?;
         let rows = stmt.query_map([grace_period_hours * 3600], |row| row.get(0))?;
         let mut res = Vec::new();
@@ -1250,7 +1405,7 @@ impl Db {
             // `gc`, permanently bricking that snapshot's restore. Surface the error.
             let snap_conn = Connection::open(&temp_path)
                 .map_err(|e| anyhow::anyhow!("snapshot {snap_id} is corrupt: cannot open: {e}"))?;
-            // Use shared helper (with return-code check) for snapshot connections.
+            // use shared helper (with H-8 return check) for snapshot connections.
             if let Some(ref pwd) = self.pwd {
                 apply_cipher_key(&snap_conn, pwd, self.kdf_iter).map_err(|e| {
                     anyhow::anyhow!("snapshot {snap_id} is corrupt: cannot key: {e}")
@@ -1288,19 +1443,190 @@ impl Db {
         // use a single connection for both backup_to_bytes and
         // the INSERT to avoid deadlock: two pool.get() calls from the same
         // thread can deadlock when the pool is near capacity.
-        let conn = self.pool.get()?;
+        let mut conn = self.pool.get()?;
         let db_data = self.backup_to_bytes_conn(&conn)?;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| anyhow::anyhow!("system clock is before the Unix epoch: {e}"))?
             .as_secs();
 
-        conn.execute(
-            "INSERT INTO snapshots (name, timestamp, db_data) VALUES (?1, ?2, ?3)",
-            rusqlite::params![name, ts, db_data],
+        // H10: persist the Merkle tree root of the file tree so a fast snapshot
+        // diff can first compare roots (equal → identical tree, no deep walk).
+        // None when the tree is not fully digests-able (e.g. symlinks/regions
+        // without a stored file digest) — never a guess.
+        //
+        // BF-04.5: the root MUST describe the frozen `db_data`, not whatever
+        // the live tree looks like a moment later. Compute it from the
+        // extracted copy (temp file), so a concurrent write between the
+        // VACUUM INTO and this step can no longer make the snapshot's root
+        // disagree with its own bytes.
+        let tree_root = {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("snapshot-root.db");
+            std::fs::write(&path, &db_data)?;
+            let frozen = Db::new_with_tuning(
+                path.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("non-UTF8 snapshot temp path"))?,
+                self.pwd.as_ref(),
+                &DbTuning {
+                    kdf_iter: self.kdf_iter,
+                    // a short-lived auxiliary connection must not leave a
+                    // background r2d2 replenish racing process exit.
+                    min_idle: 0,
+                    ..Default::default()
+                },
+            )?;
+            frozen.tree_root()?.map(|h| h.to_vec())
+        };
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO snapshots (name, timestamp, db_data, tree_root) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![name, ts, db_data, tree_root],
         )?;
+        Self::bump_snapshot_revision(&tx)?;
+        tx.commit()?;
 
         Ok(())
+    }
+
+    /// H10: stored tree root of a snapshot (`None` when unavailable at creation).
+    pub fn snapshot_tree_root(&self, id: u64) -> Result<Option<[u8; 32]>> {
+        let conn = self.pool.get()?;
+        let res = conn.query_row(
+            "SELECT tree_root FROM snapshots WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        );
+        match res {
+            Ok(Some(bytes)) if bytes.len() == 32 => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&bytes);
+                Ok(Some(out))
+            }
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// H10: deterministic Merkle root over the file tree (hierarchical, sorted
+    /// children per directory; files bind their stored `file_digest`).  Returns
+    /// `None` when the tree cannot be fully authenticated: a directory/regular
+    /// file or symlink without a stored digest, or an unsupported kind (fifo/…).
+    /// This deliberately errs towards "unavailable" instead of a false root.
+    fn node_hash(&self, id: u64, name: &str, mode: u32) -> Result<Option<[u8; 32]>> {
+        // H10: only authenticated kinds and digests contribute; anything else
+        // makes the whole root unavailable (None), never a guessed value.
+        let kind = match mode & 0o170000 {
+            0o040000 => 2u8,      // directory
+            0o100000 => 1u8,      // regular file
+            0o120000 => 3u8,      // symlink, digest binds target bytes
+            _ => return Ok(None), // fifo/…: not authenticated here
+        };
+        let content = if kind == 2 {
+            match self.children_hashes(id)? {
+                Some(hashes) => merkle_hashes(&hashes),
+                None => return Ok(None),
+            }
+        } else {
+            match self.get_file_digest(id)? {
+                Some(d) => d,
+                None => return Ok(None),
+            }
+        };
+        // Same field encoding as the snapshot helper (kind·mode, length-prefixed
+        // name, content hash) so roots are comparable across tools.
+        let mut h = blake3::Hasher::new_derive_key("cairn snapshot entry v1");
+        h.update(&[kind]);
+        h.update(&mode.to_le_bytes());
+        h.update(&(name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(&content);
+        Ok(Some(*h.finalize().as_bytes()))
+    }
+
+    /// H10: deterministic Merkle root over the file tree. `None` when the tree
+    /// cannot be fully authenticated (a file without its stored digest, or an
+    /// unsupported kind like a symlink/fifo).
+    pub fn tree_root(&self) -> Result<Option<[u8; 32]>> {
+        const ROOT: u64 = 1;
+        match self.get_inode(ROOT)? {
+            Some((mode, _, _, _, _, _, _)) => self.node_hash(ROOT, "", mode),
+            None => Ok(None),
+        }
+    }
+
+    /// children (name, id, mode) of `parent`, sorted by name.
+    pub fn children_hashes(&self, parent: u64) -> Result<Option<Vec<[u8; 32]>>> {
+        // BF-04.6: collect the child list FIRST and release the pooled
+        // connection before recursing — holding it across `node_hash` consumed
+        // one connection per tree level and deadlocked trees deeper than the
+        // pool (reproduced with a 2-connection pool, depth 2).
+        let children: Vec<(String, u64, u32)> = {
+            let conn = self.pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT d.name, d.inode_id, i.mode
+                 FROM dentries d JOIN inodes i ON i.id = d.inode_id
+                 WHERE d.parent_inode = ?1 ORDER BY d.name",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![parent], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
+        let mut out = Vec::new();
+        for (name, id, mode) in children {
+            match self.node_hash(id, &name, mode)? {
+                Some(h) => out.push(h),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// H15: children of `parent` as (name, id, mode, node_hash) tuples, sorted
+    /// by name — the input an inclusion proof needs, so the caller can locate
+    /// the child's index and verify its merkle membership against the merkle
+    /// root the parent's node hash binds.  `None` when any child lacks an
+    /// authenticated node hash (same rule as `children_hashes`).
+    pub fn children_nodes(&self, parent: u64) -> Result<Option<Vec<ChildNode>>> {
+        // BF-04.6: same connection-release rule as `children_hashes`.
+        let children: Vec<(String, u64, u32)> = {
+            let conn = self.pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT d.name, d.inode_id, i.mode
+                 FROM dentries d JOIN inodes i ON i.id = d.inode_id
+                 WHERE d.parent_inode = ?1 ORDER BY d.name",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![parent], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
+        let mut out = Vec::new();
+        for (name, id, mode) in children {
+            match self.node_hash(id, &name, mode)? {
+                Some(h) => out.push((name, id, mode, h)),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
     }
 
     pub fn backup_to_bytes(&self) -> Result<Vec<u8>> {
@@ -1365,6 +1691,28 @@ impl Db {
         Ok(())
     }
 
+    /// Object IDs needed by one frozen snapshot.  The index is copied out
+    /// first, then opened with the same SQLCipher credentials, so a corrupt or
+    /// unavailable snapshot is an error rather than an empty export set.
+    pub fn snapshot_used_objects(&self, snap_id: u64) -> Result<std::collections::HashSet<String>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp
+            .path()
+            .join("snapshot.db")
+            .to_string_lossy()
+            .to_string();
+        self.extract_snapshot(snap_id, &path)?;
+        let snapshot = Db::new_with_tuning(
+            &path,
+            self.pwd.as_ref(),
+            &DbTuning {
+                kdf_iter: self.kdf_iter,
+                ..DbTuning::default()
+            },
+        )?;
+        snapshot.get_all_indexed_chunk_objects()
+    }
+
     /// Materialize snapshot `snap_id` as a standalone database file at `out_path`,
     /// carrying over the CURRENT snapshot history (snapshot blobs are stored with
     /// an emptied `snapshots` table — restoring one verbatim would destroy every
@@ -1372,23 +1720,83 @@ impl Db {
     pub fn restore_snapshot_to(&self, snap_id: u64, out_path: &str) -> Result<()> {
         self.extract_snapshot(snap_id, out_path)?;
 
+        // A rollback restores filesystem/index data, not the live control-plane.
+        // Capture it before opening the frozen copy: protection, identities and
+        // operation results must not be silently rewound with file state.
+        let (snapshots, controls, config, operations) = {
+            let conn = self.pool.get()?;
+            let snapshots = conn
+                .prepare("SELECT id,name,timestamp,db_data,tree_root FROM snapshots")?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, u64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, u64>(2)?,
+                        r.get::<_, Vec<u8>>(3)?,
+                        r.get::<_, Option<Vec<u8>>>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let controls = conn
+                .prepare("SELECT snapshot_id,protected,tags_json FROM snapshot_controls")?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, u64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let config = conn
+                .prepare("SELECT key,value FROM config")?
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let operations = conn
+                .prepare(
+                    "SELECT operation_id,archive_id,plan_hash,result_json FROM snapshot_operations",
+                )?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            (snapshots, controls, config, operations)
+        };
+
         let restored = Connection::open(out_path)?;
         if let Some(ref pwd) = self.pwd {
             apply_cipher_key(&restored, pwd, self.kdf_iter)?;
         }
-        let conn = self.pool.get()?;
-        let mut stmt = conn.prepare("SELECT id, name, timestamp, db_data FROM snapshots")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: u64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let ts: u64 = row.get(2)?;
-            let data: Vec<u8> = row.get(3)?;
-            restored.execute(
-                "INSERT INTO snapshots (id, name, timestamp, db_data) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![id, name, ts, data],
+        let tx = restored.unchecked_transaction()?;
+        for (id, name, ts, data, tree_root) in snapshots {
+            tx.execute(
+                "INSERT INTO snapshots (id, name, timestamp, db_data, tree_root) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, name, ts, data, tree_root],
             )?;
         }
+        tx.execute("DELETE FROM snapshot_controls", [])?;
+        for (id, protected, tags) in controls {
+            tx.execute(
+                "INSERT INTO snapshot_controls(snapshot_id,protected,tags_json) VALUES(?1,?2,?3)",
+                rusqlite::params![id, protected, tags],
+            )?;
+        }
+        tx.execute("DELETE FROM config", [])?;
+        for (key, value) in config {
+            tx.execute(
+                "INSERT INTO config(key,value) VALUES(?1,?2)",
+                rusqlite::params![key, value],
+            )?;
+        }
+        tx.execute("DELETE FROM snapshot_operations", [])?;
+        for (id, archive_id, plan_hash, result) in operations {
+            tx.execute("INSERT INTO snapshot_operations(operation_id,archive_id,plan_hash,result_json) VALUES(?1,?2,?3,?4)", rusqlite::params![id, archive_id, plan_hash, result])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1533,11 +1941,264 @@ impl Db {
         Ok(res)
     }
 
-    pub fn delete_snapshot(&self, snap_id: u64) -> Result<()> {
-        self.pool.get()?.execute(
-            "DELETE FROM snapshots WHERE id = ?1",
+    pub fn delete_snapshot(&self, snap_id: u64) -> Result<Option<(String, u64)>> {
+        // Return (name, timestamp) of the deleted snapshot so retention callers
+        // can react explicitly (e.g. re-anchor the H15 checkpoint) instead of
+        // guessing. Ok(None) when the id did not exist.
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row = tx.query_row(
+            "SELECT name, timestamp FROM snapshots WHERE id = ?1",
             rusqlite::params![snap_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)),
+        );
+        let info = match row {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        if info.is_some() {
+            let protected: Option<i64> = tx
+                .query_row(
+                    "SELECT protected FROM snapshot_controls WHERE snapshot_id=?1",
+                    [snap_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if protected.unwrap_or(0) != 0 {
+                anyhow::bail!("SNAPSHOT_PROTECTED");
+            }
+            tx.execute(
+                "DELETE FROM snapshots WHERE id = ?1",
+                rusqlite::params![snap_id],
+            )?;
+            Self::bump_snapshot_revision(&tx)?;
+        }
+        tx.commit()?;
+        Ok(info)
+    }
+
+    /// Delete a batch of snapshots atomically. Returns the (id, name, ts) of
+    /// every deleted row; ids that did not exist are skipped silently.
+    pub fn delete_snapshots(&self, ids: &[u64]) -> Result<Vec<(u64, String, u64)>> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        let mut deleted = Vec::new();
+        {
+            let mut get = tx.prepare("SELECT name, timestamp FROM snapshots WHERE id = ?1")?;
+            let mut del = tx.prepare("DELETE FROM snapshots WHERE id = ?1")?;
+            for &id in ids {
+                let row = get.query_row(rusqlite::params![id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+                });
+                match row {
+                    Ok((name, ts)) => {
+                        let protected: Option<i64> = tx
+                            .query_row(
+                                "SELECT protected FROM snapshot_controls WHERE snapshot_id=?1",
+                                [id],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        if protected.unwrap_or(0) != 0 {
+                            anyhow::bail!("SNAPSHOT_PROTECTED");
+                        }
+                        del.execute(rusqlite::params![id])?;
+                        deleted.push((id, name, ts));
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        if !deleted.is_empty() {
+            Self::bump_snapshot_revision(&tx)?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Stable state for external retention controllers.  The revision changes
+    /// with every successful batch deletion and makes a plan fail closed if the
+    /// snapshot list changed between planning and applying.
+    pub fn snapshot_history(&self) -> Result<SnapshotHistory> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        let archive_id: Option<String> = tx
+            .query_row(
+                "SELECT value FROM config WHERE key = 'archive_id'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let archive_id = match archive_id {
+            Some(id) => id,
+            None => {
+                let seed = format!(
+                    "{}:{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                );
+                let id = blake3::hash(seed.as_bytes()).to_hex().to_string();
+                tx.execute(
+                    "INSERT INTO config(key,value) VALUES('archive_id',?1)",
+                    [&id],
+                )?;
+                id
+            }
+        };
+        let revision = Self::snapshot_revision(&tx)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO config(key,value) VALUES('snapshot_history_revision','0')",
+            [],
         )?;
+        let mut stmt = tx.prepare("SELECT id,name,timestamp FROM snapshots ORDER BY id")?;
+        let snapshots = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        tx.commit()?;
+        Ok(SnapshotHistory {
+            archive_id,
+            revision,
+            snapshots,
+        })
+    }
+
+    pub fn apply_snapshot_delete_plan(
+        &self,
+        archive_id: &str,
+        revision: u64,
+        ids: &[u64],
+        allow_empty: bool,
+    ) -> Result<Vec<(u64, String, u64)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if !ids.iter().all(|id| unique.insert(*id)) {
+            anyhow::bail!("duplicate snapshot id in delete plan");
+        }
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current_id: Option<String> = tx
+            .query_row("SELECT value FROM config WHERE key='archive_id'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if current_id.as_deref() != Some(archive_id) {
+            anyhow::bail!("WRONG_ARCHIVE");
+        }
+        let current_rev = Self::snapshot_revision(&tx)?;
+        if current_rev != revision {
+            anyhow::bail!("STALE_HISTORY");
+        }
+        let total: u64 = tx.query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?;
+        if !allow_empty && total <= unique.len() as u64 {
+            anyhow::bail!("EMPTY_HISTORY_FORBIDDEN");
+        }
+        let mut deleted = Vec::new();
+        for id in unique {
+            let protected: Option<i64> = tx
+                .query_row(
+                    "SELECT protected FROM snapshot_controls WHERE snapshot_id=?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            if protected.unwrap_or(0) != 0 {
+                anyhow::bail!("SNAPSHOT_PROTECTED");
+            }
+            let row = tx
+                .query_row(
+                    "SELECT name,timestamp FROM snapshots WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)),
+                )
+                .map_err(|_| anyhow::anyhow!("unknown snapshot id {id}"))?;
+            deleted.push((id, row.0, row.1));
+        }
+        for (id, _, _) in &deleted {
+            tx.execute("DELETE FROM snapshots WHERE id=?1", [id])?;
+        }
+        Self::bump_snapshot_revision(&tx)?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    pub fn snapshot_control(&self, id: u64) -> Result<(bool, String)> {
+        let conn = self.pool.get()?;
+        match conn.query_row(
+            "SELECT protected,tags_json FROM snapshot_controls WHERE snapshot_id=?1",
+            [id],
+            |r| Ok((r.get::<_, i64>(0)? != 0, r.get(1)?)),
+        ) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((false, "[]".into())),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_snapshot_control(
+        &self,
+        id: u64,
+        protected: Option<bool>,
+        tags_json: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM snapshots WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("unknown snapshot id {id}");
+        }
+        let old = tx
+            .query_row(
+                "SELECT protected,tags_json FROM snapshot_controls WHERE snapshot_id=?1",
+                [id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, "[]".into()));
+        let p = protected.map(|v| if v { 1 } else { 0 }).unwrap_or(old.0);
+        let tags = tags_json.unwrap_or(&old.1);
+        tx.execute("INSERT INTO snapshot_controls(snapshot_id,protected,tags_json) VALUES(?1,?2,?3) ON CONFLICT(snapshot_id) DO UPDATE SET protected=excluded.protected,tags_json=excluded.tags_json", rusqlite::params![id,p,tags])?;
+        Self::bump_snapshot_revision(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retention trim: keep only the `keep_newest` most recent snapshots (by
+    /// timestamp, id as tiebreak) and delete the rest from the START of the
+    /// timeline, atomically. Returns the deleted rows.
+    pub fn prune_snapshots(&self, keep_newest: usize) -> Result<Vec<(u64, String, u64)>> {
+        let all = self.list_snapshots()?;
+        if all.len() <= keep_newest {
+            return Ok(Vec::new());
+        }
+        // Newest first; ORDER BY ts DESC, id DESC is the definition of "newest".
+        let mut sorted = all.clone();
+        sorted.sort_by(|a, b| b.2.cmp(&a.2).then(b.0.cmp(&a.0)));
+        let to_delete: Vec<u64> = sorted
+            .iter()
+            .skip(keep_newest)
+            .map(|(id, _, _)| *id)
+            .collect();
+        self.delete_snapshots(&to_delete)
+    }
+
+    /// Reclaim dead snapshot storage. DELETE rows free pages inside the file but
+    /// the file does not shrink without VACUUM (auto_vacuum is off) — retention
+    /// callers must run this after batch deletion to actually return space.
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.pool.get()?;
+        conn.execute("VACUUM", [])?;
         Ok(())
     }
 
@@ -1589,6 +2250,37 @@ impl Db {
             rusqlite::params![size, id],
         )?;
         Ok(())
+    }
+
+    /// H09: persist the whole-file digest in the (protected) index metadata so
+    /// a later restore can prove the reconstructed bytes, order and size.
+    pub fn set_file_digest(&self, id: u64, digest: &[u8; 32]) -> Result<()> {
+        self.pool.get()?.execute(
+            "UPDATE inodes SET file_digest = ?1 WHERE id = ?2",
+            rusqlite::params![digest.as_slice(), id],
+        )?;
+        Ok(())
+    }
+
+    /// H09: read the stored whole-file digest; `None` when the file was never
+    /// finalized with a digest (pre-H09 archives / inline edge cases).
+    pub fn get_file_digest(&self, id: u64) -> Result<Option<[u8; 32]>> {
+        let conn = self.pool.get()?;
+        let res = conn.query_row(
+            "SELECT file_digest FROM inodes WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        );
+        match res {
+            Ok(Some(bytes)) if bytes.len() == 32 => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&bytes);
+                Ok(Some(out))
+            }
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// write-path atomic update of `size` + `mtime` + `ctime`
@@ -1661,8 +2353,8 @@ impl Db {
     /// Read a config value. Returns `Ok(None)` ONLY for "key not set"
     /// (`SQLITE_ROW` returned zero rows, surfaced as `QueryReturnedNoRows`);
     /// any other DB error propagates so a busy / corrupt / IO error is not
-    /// misclassified as a missing key. Same discipline as
-    /// `get_inline_data` and `get_parent_inode`.
+    /// misclassified as a missing key. same discipline as
+    /// R-15 for `get_inline_data` and `get_parent_inode`.
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare("SELECT value FROM config WHERE key = ?1")?;
@@ -2492,6 +3184,65 @@ mod tests {
     }
 
     #[test]
+    fn protected_snapshot_cannot_be_deleted_by_legacy_api() {
+        let db = test_db();
+        db.create_snapshot("protected").unwrap();
+        let id = db.list_snapshots().unwrap()[0].0;
+        db.set_snapshot_control(id, Some(true), None).unwrap();
+
+        let err = db.delete_snapshot(id).unwrap_err();
+        assert_eq!(err.to_string(), "SNAPSHOT_PROTECTED");
+        assert_eq!(db.list_snapshots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn snapshot_creation_makes_old_delete_plan_stale() {
+        let db = test_db();
+        db.create_snapshot("one").unwrap();
+        db.create_snapshot("two").unwrap();
+        let history = db.snapshot_history().unwrap();
+        let first_id = history.snapshots[0].0;
+
+        db.create_snapshot("three").unwrap();
+        let err = db
+            .apply_snapshot_delete_plan(&history.archive_id, history.revision, &[first_id], false)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "STALE_HISTORY");
+    }
+
+    #[test]
+    fn rollback_keeps_live_snapshot_control_plane() {
+        let db = test_db();
+        db.create_snapshot("old").unwrap();
+        let old_id = db.list_snapshots().unwrap()[0].0;
+        // Initialize persistent identity/revision before the frozen copy.
+        let old_history = db.snapshot_history().unwrap();
+        db.set_snapshot_control(old_id, Some(true), Some("[\"keep\"]"))
+            .unwrap();
+        db.create_snapshot("new").unwrap();
+        let before = db.snapshot_history().unwrap();
+        let out = std::env::temp_dir().join(format!(
+            "cairn-rollback-control-{}-{}.db",
+            std::process::id(),
+            old_id
+        ));
+        let _ = std::fs::remove_file(&out);
+        db.restore_snapshot_to(old_id, out.to_str().unwrap())
+            .unwrap();
+        let restored = Db::new(out.to_str().unwrap(), None).unwrap();
+
+        assert_eq!(
+            restored.snapshot_control(old_id).unwrap(),
+            (true, "[\"keep\"]".into())
+        );
+        let after = restored.snapshot_history().unwrap();
+        assert_eq!(after.archive_id, before.archive_id);
+        assert_eq!(after.revision, before.revision);
+        assert!(after.revision > old_history.revision);
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
     fn unlink_last_link_removes_inode_and_chunks() {
         let db = test_db();
         let parent_ino = 1;
@@ -2521,5 +3272,423 @@ mod tests {
         db.delete_inode(ino).unwrap();
         assert!(db.get_inode(ino).unwrap().is_none());
         assert!(db.get_file_chunks(ino).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_chunk_domain_flag_defaults_false_and_roundtrips() {
+        let db = test_db();
+        let oid = "obj-domain-test".to_string();
+        db.insert_chunk_indices_batch(&[(
+            oid.clone(),
+            "plaintext-hash".to_string(),
+            b"wrapped-key".to_vec(),
+            0,
+            "aes-gcm".to_string(),
+        )])
+        .unwrap();
+
+        // Schema v2 default: fresh chunks are archive-scope (domain = 0).
+        assert!(!db.get_chunk_domain(&oid).unwrap());
+        assert!(!db.get_chunk_domain("object-not-present").unwrap());
+
+        db.set_chunk_domain(&oid, true).unwrap();
+        assert!(db.get_chunk_domain(&oid).unwrap());
+        db.set_chunk_domain(&oid, false).unwrap();
+        assert!(!db.get_chunk_domain(&oid).unwrap());
+
+        // The archive-scope dedup path stays intact afterwards.
+        assert!(db.get_chunk_by_hash("plaintext-hash").unwrap().is_some());
+    }
+    #[test]
+    fn snapshot_capture_is_point_in_time_and_immutable() {
+        let db = test_db();
+        let ino = db
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, "f", None)
+            .unwrap();
+        db.insert_chunk_indices_batch(&[(
+            "obj-a".to_string(),
+            "ph-a".to_string(),
+            b"k".to_vec(),
+            0,
+            "aes-gcm".to_string(),
+        )])
+        .unwrap();
+        db.insert_file_chunk(ino, 0, "obj-a", 4, 0).unwrap();
+        db.create_snapshot("v1").unwrap();
+
+        // The live DB mutates AFTER v1 was captured.
+        db.insert_chunk_indices_batch(&[(
+            "obj-b".to_string(),
+            "ph-b".to_string(),
+            b"k".to_vec(),
+            0,
+            "aes-gcm".to_string(),
+        )])
+        .unwrap();
+        db.insert_file_chunk(ino, 0, "obj-b", 8, 0).unwrap();
+        db.create_snapshot("v2").unwrap();
+
+        let snaps = db.list_snapshots().unwrap();
+        assert_eq!(snaps.len(), 2, "both versions must be listed");
+        assert_eq!(snaps[0].1, "v1");
+        assert_eq!(snaps[1].1, "v2");
+
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("v1.db");
+        let p2 = dir.path().join("v2.db");
+        db.extract_snapshot(snaps[0].0, p1.to_str().unwrap())
+            .unwrap();
+        db.extract_snapshot(snaps[1].0, p2.to_str().unwrap())
+            .unwrap();
+        let b1 = std::fs::read(&p1).unwrap();
+        let b2 = std::fs::read(&p2).unwrap();
+        assert!(!b1.is_empty() && !b2.is_empty());
+        // L01: snapshot bytes are captured AT CREATE TIME — a lazy/at-extract
+        // capture would make v1 == v2.  Different bytes prove the version is
+        // immutable after creation (draft v1 pinned, committed at capture).
+        assert_ne!(
+            b1, b2,
+            "snapshot must be captured at create time, not at extract"
+        );
+    }
+    #[test]
+    fn snapshot_is_self_consistent_under_concurrent_writes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // File-backed DB: the shared-cache memory DB (test_db) raises
+        // SQLITE_LOCKED for a concurrent VACUUM INTO; a real archive uses a
+        // file + WAL + busy_timeout, which this mirrors.
+        let tdir = tempfile::tempdir().unwrap();
+        let db = Db::new(tdir.path().join("t.db").to_str().unwrap(), None).unwrap();
+        let ino = db
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, "busy", None)
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let dbw = db.clone();
+        let writer = std::thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop2.load(Ordering::Relaxed) {
+                let oid = format!("obj-write-{n}");
+                n += 1;
+                dbw.insert_chunk_indices_batch(&[(
+                    oid.clone(),
+                    format!("ph-{n}"),
+                    b"k".to_vec(),
+                    0,
+                    "aes-gcm".to_string(),
+                )])
+                .unwrap();
+                dbw.insert_file_chunk(ino, 0, &oid, 1, 0).unwrap();
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..25 {
+            db.create_snapshot(&format!("v{i}")).unwrap();
+            let snaps = db.list_snapshots().unwrap();
+            let (sid, _, _) = *snaps.last().unwrap();
+            let out = dir.path().join(format!("snap-{sid}.db"));
+            db.extract_snapshot(sid, out.to_str().unwrap()).unwrap();
+            let snap_db = Db::new(out.to_str().unwrap(), None).unwrap();
+            for (oid, _, _, _, _, _) in snap_db.get_file_chunks(ino).unwrap() {
+                assert!(
+                    snap_db.chunk_exists(&oid).unwrap(),
+                    "snapshot {sid} has dangling file_chunks -> {oid}"
+                );
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+    #[test]
+    fn pending_upload_pins_an_unreferenced_chunk_against_gc() {
+        let db = test_db();
+        db.insert_chunk_indices_batch(&[(
+            "obj-pending".to_string(),
+            "ph-pending".to_string(),
+            b"k".to_vec(),
+            0,
+            "aes-gcm".to_string(),
+        )])
+        .unwrap();
+        db.pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE chunk_index SET created_at = strftime('%s','now') - 7200 WHERE object_id = 'obj-pending'",
+                [],
+            )
+            .unwrap();
+
+        // Pinned: queued for upload but not yet referenced by any file.
+        db.enqueue_upload("obj-pending").unwrap();
+        let orphans = db.get_orphaned_chunks(0).unwrap();
+        assert!(
+            !orphans.contains(&"obj-pending".to_string()),
+            "pending upload must pin the object against GC"
+        );
+
+        // Upload completes: unpinned (queue row removed) + still unreferenced
+        // -> now the object is a GC candidate again.
+        db.dequeue_upload("obj-pending").unwrap();
+        let orphans2 = db.get_orphaned_chunks(0).unwrap();
+        assert!(
+            orphans2.contains(&"obj-pending".to_string()),
+            "after upload the unreferenced object must return to GC candidates"
+        );
+    }
+
+    #[test]
+    fn tree_root_acts_as_equality_oracle_and_persists_in_snapshot() {
+        let db = test_db();
+        let dir = db
+            .insert_inode_with_dentry(libc::S_IFDIR | 0o755, 0, 0, 0, 2, 1, "d1", None)
+            .unwrap();
+        let f = db
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, dir, "f", None)
+            .unwrap();
+        db.set_file_digest(f, &[1u8; 32]).unwrap();
+
+        let root_a = db
+            .tree_root()
+            .unwrap()
+            .expect("digested tree must have a root");
+
+        // Creating a snapshot must persist exactly this root.
+        db.create_snapshot("s1").unwrap();
+        let (sid1, _, _) = *db.list_snapshots().unwrap().first().unwrap();
+        assert_eq!(db.snapshot_tree_root(sid1).unwrap(), Some(root_a));
+
+        // A content change (different file digest) must change both the live
+        // root and the next snapshot's stored root.
+        db.set_file_digest(f, &[2u8; 32]).unwrap();
+        assert_ne!(db.tree_root().unwrap(), Some(root_a));
+        db.create_snapshot("s2").unwrap();
+        let (sid2, _, _) = *db.list_snapshots().unwrap().get(1).unwrap();
+        assert_ne!(
+            db.snapshot_tree_root(sid1).unwrap(),
+            db.snapshot_tree_root(sid2).unwrap(),
+            "snapshots before/after the change must differ"
+        );
+    }
+
+    #[test]
+    fn tree_root_is_none_when_a_file_lacks_digest() {
+        let db = test_db();
+        let f = db
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 1, "plain", None)
+            .unwrap();
+        // No file_digest for "plain" → the tree cannot be authenticated.
+        assert!(db.tree_root().unwrap().is_none());
+        db.set_file_digest(f, &[5u8; 32]).unwrap();
+        assert!(db.tree_root().unwrap().is_some());
+    }
+
+    // BF-04.5: the persisted root must equal the root of the extracted copy
+    // (the bytes the snapshot actually carries), for every snapshot.
+    #[test]
+    fn snapshot_root_matches_the_frozen_copy() {
+        let db = test_db();
+        let f = db
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 1, "l", None)
+            .unwrap();
+        db.set_file_digest(f, &[7u8; 32]).unwrap();
+
+        for (i, _) in (0..5).enumerate() {
+            db.set_file_digest(f, &[i as u8 + 1; 32]).unwrap();
+            db.create_snapshot(&format!("s{i}")).unwrap();
+            let snaps = db.list_snapshots().unwrap();
+            let sid = snaps.last().unwrap().0;
+
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("frozen.db");
+            db.extract_snapshot(sid, out.to_str().unwrap()).unwrap();
+            let frozen = Db::new(out.to_str().unwrap(), None).unwrap();
+            assert_eq!(
+                db.snapshot_tree_root(sid).unwrap(),
+                frozen.tree_root().unwrap(),
+                "snapshot {sid} root must describe its own frozen bytes"
+            );
+        }
+    }
+
+    // BF-04.6: tree walks must not hold one pooled connection per recursion
+    // level. With max_connections = 2 a depth-5 tree used to deadlock until the
+    // connection timeout; the walk must complete on the tiny pool.
+    #[test]
+    fn deep_tree_walk_survives_a_two_connection_pool() {
+        let tdir = tempfile::tempdir().unwrap();
+        let tuning = DbTuning {
+            max_connections: 2,
+            min_idle: 0,
+            connection_timeout_secs: 2,
+            ..Default::default()
+        };
+        let db = Db::new_with_tuning(
+            tdir.path().join("tiny-pool.db").to_str().unwrap(),
+            None,
+            &tuning,
+        )
+        .unwrap();
+
+        let mut parent = 1u64;
+        for i in 0..5 {
+            parent = db
+                .insert_inode_with_dentry(
+                    libc::S_IFDIR | 0o755,
+                    0,
+                    0,
+                    0,
+                    2,
+                    parent,
+                    &format!("d{i}"),
+                    None,
+                )
+                .unwrap();
+        }
+        let f = db
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, parent, "f", None)
+            .unwrap();
+        db.set_file_digest(f, &[9u8; 32]).unwrap();
+
+        assert!(
+            db.tree_root().unwrap().is_some(),
+            "depth-5 tree must be walkable on a 2-connection pool"
+        );
+    }
+
+    #[test]
+    fn snapshot_delete_and_prune_are_explicit_and_keep_newest() {
+        let db = test_db();
+        for name in ["old", "middle", "new"] {
+            db.create_snapshot(name).unwrap();
+            // Snapshot timestamps have second resolution; the id is the
+            // documented tiebreaker, so creation order remains deterministic.
+        }
+        let snapshots = db.list_snapshots().unwrap();
+        assert_eq!(snapshots.len(), 3);
+
+        let middle = snapshots[1].0;
+        assert_eq!(
+            db.delete_snapshot(middle).unwrap().map(|v| v.0),
+            Some("middle".to_string())
+        );
+        assert_eq!(db.delete_snapshot(middle).unwrap(), None);
+
+        let deleted = db.prune_snapshots(1).unwrap();
+        assert_eq!(deleted.len(), 1);
+        let remaining = db.list_snapshots().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1, "new");
+
+        // VACUUM is a separate, explicit operation: retention never implies
+        // object-store deletion or hides a failure to reclaim SQLite pages.
+        db.vacuum().unwrap();
+    }
+
+    #[test]
+    fn external_delete_plan_rejects_stale_or_empty_history() {
+        let db = test_db();
+        db.create_snapshot("one").unwrap();
+        db.create_snapshot("two").unwrap();
+        let history = db.snapshot_history().unwrap();
+        let first = history.snapshots[0].0;
+        db.apply_snapshot_delete_plan(&history.archive_id, history.revision, &[first], false)
+            .unwrap();
+        assert!(
+            db.apply_snapshot_delete_plan(&history.archive_id, history.revision, &[first], false)
+                .is_err()
+        );
+        let fresh = db.snapshot_history().unwrap();
+        let last = fresh.snapshots[0].0;
+        assert!(
+            db.apply_snapshot_delete_plan(&fresh.archive_id, fresh.revision, &[last], false)
+                .is_err()
+        );
+    }
+
+    // BF-04.12: kdf_iter must actually change the key derivation (before the
+    // fix the pragma was issued before `key` and silently ignored), and a
+    // mismatched value must refuse to open instead of silently using 256000.
+    #[test]
+    fn kdf_iter_takes_effect_and_reopen_requires_the_same_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kdf.db");
+        let pwd = secrecy::SecretString::from("kdf-test-password".to_string());
+        let t = |kdf: u32| DbTuning {
+            kdf_iter: kdf,
+            min_idle: 0,
+            ..Default::default()
+        };
+
+        let db = Db::new_with_tuning(path.to_str().unwrap(), Some(&pwd), &t(1_024)).unwrap();
+        db.set_config("probe", "1").unwrap();
+        assert_eq!(db.kdf_iter(), 1_024, "the requested KDF must be effective");
+        drop(db);
+
+        let same = Db::new_with_tuning(path.to_str().unwrap(), Some(&pwd), &t(1_024)).unwrap();
+        assert_eq!(same.get_config("probe").unwrap().as_deref(), Some("1"));
+        drop(same);
+
+        // 2048 ≠ 256000, so the legacy-default fallback cannot mask a mismatch.
+        let wrong = Db::new_with_tuning(path.to_str().unwrap(), Some(&pwd), &t(2_048));
+        assert!(wrong.is_err(), "mismatched kdf_iter must refuse to open");
+    }
+
+    // BF-04.12 migration: archives created before the pragma-order fix were
+    // keyed with the SQLCipher default regardless of CAIRN_KDF_ITER. They must
+    // keep opening, and the handle must report the EFFECTIVE value so snapshot
+    // copies and partial restores derive the same key.
+    #[test]
+    fn legacy_default_keyed_archive_opens_with_effective_kdf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let pwd = secrecy::SecretString::from("kdf-test-password".to_string());
+        {
+            let default_tuning = DbTuning {
+                kdf_iter: 256_000,
+                min_idle: 0,
+                ..Default::default()
+            };
+            let db =
+                Db::new_with_tuning(path.to_str().unwrap(), Some(&pwd), &default_tuning).unwrap();
+            db.set_config("probe", "legacy").unwrap();
+        }
+
+        let legacy_tuning = DbTuning {
+            kdf_iter: 1_024,
+            min_idle: 0,
+            ..Default::default()
+        };
+        let reopened = Db::new_with_tuning(path.to_str().unwrap(), Some(&pwd), &legacy_tuning)
+            .expect("legacy archive must open via the default-KDF fallback");
+        assert_eq!(reopened.kdf_iter(), 256_000);
+        assert_eq!(
+            reopened.get_config("probe").unwrap().as_deref(),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn wrong_password_is_rejected_on_a_kdf_tuned_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kdf-pw.db");
+        let pwd = secrecy::SecretString::from("correct-password".to_string());
+        let tuning = DbTuning {
+            kdf_iter: 1_024,
+            min_idle: 0,
+            ..Default::default()
+        };
+        {
+            let db = Db::new_with_tuning(path.to_str().unwrap(), Some(&pwd), &tuning).unwrap();
+            db.set_config("probe", "1").unwrap();
+        }
+        let wrong = secrecy::SecretString::from("wrong-password".to_string());
+        assert!(
+            Db::new_with_tuning(path.to_str().unwrap(), Some(&wrong), &tuning).is_err(),
+            "a wrong password must never open a kdf-tuned archive"
+        );
     }
 }

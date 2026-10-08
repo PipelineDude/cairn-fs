@@ -3,7 +3,9 @@
 //! Owns the shared `CloudOperator` handle (moved here from cairn-cdc — its natural home)
 //! and the read path (`fetch_chunk`). The write/upload path currently still lives in
 //! `cairn-cdc::Chunker::process_data`; folding it into a `ChunkStore` trait here is a
-//! future refinement.
+//! future refinement (see MIGRATION.md).
+
+pub mod shared_dedup;
 
 // Cloud storage handle, shared across the workspace. With the `cloud-storage` feature
 // this is a real `opendal::Operator`; without it, a zero-sized `Clone` (not `Copy`)
@@ -514,6 +516,7 @@ pub async fn upload_chunk_impl(
     operators: &[CloudOperator],
     raid_mode: &str,
     rate_limiter: &Option<std::sync::Arc<leaky_bucket::RateLimiter>>,
+    sleep_secs: &(dyn Fn(u32) -> u64 + Send + Sync),
 ) -> anyhow::Result<()> {
     if operators.is_empty() {
         return Ok(());
@@ -601,7 +604,7 @@ pub async fn upload_chunk_impl(
             failed.len(),
             backoff
         );
-        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs(attempt))).await;
         pending = failed;
     }
 }
@@ -715,7 +718,10 @@ pub async fn upload_chunk_from_cache_impl(
              refusing to upload corrupt data to cloud"
         );
     }
-    upload_chunk_impl(data, hash_key, operators, raid_mode, rate_limiter).await
+    upload_chunk_impl(data, hash_key, operators, raid_mode, rate_limiter, &|n| {
+        std::cmp::min(30u64, 1u64 << n)
+    })
+    .await
 }
 
 #[async_trait::async_trait]
@@ -793,6 +799,7 @@ impl ChunkStore for CairnStore {
             &self.operators,
             raid_mode,
             &self.rate_limiter,
+            &|n| std::cmp::min(30u64, 1u64 << n),
         )
         .await
     }

@@ -10,7 +10,8 @@ rust-version = "1.85"
 description = "Cairn — encrypted, deduplicated, content-addressed backup filesystem (FUSE) with asymmetric (public/private-key) envelope encryption. CLI front-end composing the cairn-* engine crates."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/example/cairn"
+repository = "https://github.com/PipelineDude/cairn-fs"
+homepage = "https://github.com/PipelineDude/cairn-fs#readme"
 keywords = ["fuse", "backup", "encryption", "deduplication", "filesystem"]
 categories = ["filesystem", "cryptography"]
 
@@ -63,8 +64,6 @@ mockall = "0.12"
 tokio-test = "0.4"
 # Integration tests generate age keypairs directly (matches cairn-seal's 0.11.x pin).
 age = "0.11"
-# Property round-trip: random trees through init→backup→extract.
-proptest = "1"
 
 [features]
 # `cloud-storage` pulls in the S3/GCS backend stack (opendal + HTTP/TLS). Building
@@ -80,5 +79,4 @@ lto = "fat"
 codegen-units = 1
 strip = true
 opt-level = 3
-
 

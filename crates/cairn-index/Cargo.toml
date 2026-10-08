@@ -13,6 +13,7 @@ r2d2_sqlite = "0.24.0"
 secrecy = "0.10.3"
 anyhow = "1.0"
 tracing = "0.1.44"
+blake3 = "1.8.5"
 libc = "0.2"
 tempfile = "3.27.0"
 

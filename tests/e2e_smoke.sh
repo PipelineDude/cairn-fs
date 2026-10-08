@@ -116,7 +116,19 @@ if command -v trivy >/dev/null 2>&1; then
   # judge by trivy's own exit code with the .trivyignore baseline —
   # the old grep pipeline matched trivy's SUMMARY line ("Failures: 1 (HIGH: …)")
   # so the gate was permanently red on the accepted-known DS-0002.
-  if trivy fs --scanners vuln,secret,config,license --severity HIGH,CRITICAL \
+  #
+  # Disk pre-flight (2026-09-18): trivy's DB download + extraction needs ~2 GB
+  # free (the extracted trivy.db alone measured 1.4 GB). On a full disk trivy
+  # exits non-zero for that environmental reason, and the old wiring turned it
+  # into "[FAIL] NEW HIGH/CRITICAL findings" with no finding behind it (exactly
+  # what happened at /home 100 % full). Low disk must read as a skip, never as
+  # a security regression; TRIVY_MIN_FREE_MB overrides the 2048 MB threshold.
+  TRIVY_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}"
+  TRIVY_MIN_FREE_MB="${TRIVY_MIN_FREE_MB:-2048}"
+  TRIVY_FREE_MB="$(df -Pk "$TRIVY_CACHE_DIR" 2>/dev/null | awk 'NR==2 {print int($4/1024)}')"
+  if [ -n "$TRIVY_FREE_MB" ] && [ "$TRIVY_FREE_MB" -lt "$TRIVY_MIN_FREE_MB" ]; then
+    echo "  [skip] trivy: only ${TRIVY_FREE_MB} MB free on $TRIVY_CACHE_DIR (< ${TRIVY_MIN_FREE_MB} MB); DB needs ~2 GB — re-run when disk is free or set TRIVY_MIN_FREE_MB"
+  elif trivy fs --scanners vuln,secret,config,license --severity HIGH,CRITICAL \
        --exit-code 1 . >/dev/null 2>&1; then
     say "trivy clean (HIGH/CRITICAL; accepted-known baseline in .trivyignore)"
   else
@@ -170,21 +182,21 @@ for i in $(seq -w 1 150); do echo "f$i" > "mnt/many/file_$i.txt"; done
 sync
 
 echo "== statfs + create over a live mount =="
-# `df` issues statfs(2). Before this was fixed the fuse3 default returned ENOSYS
-# and the kernel substituted an all-zero statfs, so `df` reported 0 blocks. A
-# NON-zero total proves our statfs handler actually ran (logical bytes -> f_blocks).
+# `df` issues statfs(2). Before T-006 the fuse3 default returned ENOSYS and
+# the kernel substituted an all-zero statfs, so `df` reported 0 blocks. A NON-zero
+# total proves our statfs handler actually ran (logical bytes -> f_blocks).
 t006_total=$(df -P mnt 2>/dev/null | awk 'NR==2{print $2}')
 case "$t006_total" in
-  ''|*[!0-9]*) fail "statfs: df total not numeric ('$t006_total')" ;;
-  0)           fail "statfs: df reports 0 blocks (statfs still ENOSYS?)" ;;
-  *)           say "statfs: df on mount reports ${t006_total} 1K-blocks (handler live)" ;;
+  ''|*[!0-9]*) fail "T-006 statfs: df total not numeric ('$t006_total')" ;;
+  0)           fail "T-006 statfs: df reports 0 blocks (statfs still ENOSYS?)" ;;
+  *)           say "T-006 statfs: df on mount reports ${t006_total} 1K-blocks (handler live)" ;;
 esac
-# Writing a brand-new path issues open(O_CREAT) -> FUSE `create` (atomic
+# writing a brand-new path issues open(O_CREAT) -> FUSE `create` (atomic
 # mknod+open). Read the bytes straight back to prove the created fh is usable.
 echo "created via O_CREAT" > mnt/created_t030.txt
 [ "$(cat mnt/created_t030.txt 2>/dev/null)" = "created via O_CREAT" ] \
-    && say "create: O_CREAT file created + read back exact" \
-    || fail "create: O_CREAT file wrong/missing content"
+    && say "T-030 create: O_CREAT file created + read back exact" \
+    || fail "T-030 create: O_CREAT file wrong/missing content"
 
 CNT=$(ls -1 mnt/many | wc -l); UNIQ=$(ls -1 mnt/many | sort -u | wc -l)
 [ "$CNT" = 150 ] && [ "$UNIQ" = 150 ] && say "ls: 150 entries, no duplicates" \
@@ -468,7 +480,7 @@ echo "== asymmetric (write-only) archive =="
 GEN="$(dirname "$BIN")/gen_keys"
 [ -x "$GEN" ] || die "gen_keys not found next to cairn binary (cargo build builds both)"
 ( cd "$W" && "$GEN" >/dev/null ) || die "gen_keys failed"
-env -u CAIRN_PASSWORD "$BIN" --pub-key "$W/pub.pem" --priv-key "$W/priv.pem" asym.db init >/dev/null
+env -u CAIRN_PASSWORD "$BIN" --pub-key "$W/pub.pem" --priv-key "$W/priv.pem" asym.db init --allow-plaintext-index >/dev/null
 mnt asym.db --pub-key "$W/pub.pem" --priv-key "$W/priv.pem" || die "asym mount"
 cp ref.bin mnt/data.bin
 sync
@@ -1570,7 +1582,7 @@ if [ -x "$GEN_BB" ]; then
     # Shamir roundtrip. NB: keys already exist in $W from the asym section, and
     # gen_keys REFUSES to overwrite an existing priv.pem (O_EXCL, by design) —
     # an unguarded call here dies silently under `set -e` and skips the rest of
-    # the suite.
+    # the suite (soak finding F-9).
     ( cd "$W" && "$GEN_BB" >/dev/null 2>&1 ) || true
     [ -f "$W/priv.pem" ] || die "no priv.pem for shamir roundtrip"
     # split writes share_N.bin (no bb_ prefix) and refuses to overwrite (O_EXCL);
@@ -1619,7 +1631,7 @@ for cmd in init backup mount extract check verify gc scrub status snapshot push 
     "$BIN" --help 2>/dev/null | grep -qi "$cmd" && say "help mentions '$cmd'" || note "help missing '$cmd'"
 done
 # NB: `cmd; RC=$?` does NOT survive `set -e` when cmd fails — the script dies
-# before the assignment. Use `|| RC=$?`.
+# before the assignment (soak finding F-9c). Use `|| RC=$?`.
 RC_BB=0; "$BIN" >/dev/null 2>&1 || RC_BB=$?
 [ "$RC_BB" != "0" ] && say "no-args exits non-zero" || note "no-args behavior"
 RC_BB2=0; "$BIN" nonexistent_command >/dev/null 2>&1 || RC_BB2=$?
@@ -1681,10 +1693,10 @@ rm -rf "$W/bb_ded_out"; mkdir "$W/bb_ded_out"
 "$BIN" "$W/$DEDDB2" extract "$W/bb_ded_out" >/dev/null 2>&1 || die "dedup extract"
 DCNT2=0; for i in $(seq 1 10); do [ "$(cat "$W/bb_ded_out/same_$i.txt" 2>/dev/null)" = "$DED_CONTENT" ] && DCNT2=$((DCNT2+1)); done
 [ "$DCNT2" = "10" ] && say "10 identical files all deduped and restorable" || fail "dedup: $DCNT2/10"
-# --disable-dedup — the flag was REMOVED from the CLI (decision: bring it
-# back). The `|| true` on init swallowed the clap rejection and the next line
-# died on the missing archive. Gate on flag availability so this check
-# auto-reactivates the moment the flag comes back.
+# --disable-dedup — the flag was REMOVED from the CLI (FINDINGS F-6; decision:
+# bring it back). The `|| true` on init swallowed the clap rejection and the
+# next line died on the missing archive. Gate on flag availability so
+# this check auto-reactivates the moment F-6 restores the flag.
 if "$BIN" x.db init --help 2>/dev/null | grep -q -- "--disable-dedup"; then
     DDB3="bb_ded2.db"; db_clean "$W/$DDB3"
     "$BIN" "$W/$DDB3" init --disable-dedup >/dev/null 2>&1 || true
@@ -1729,7 +1741,7 @@ echo "  [blackbox] resource pressure"
 MANYDB2="bb_many.db"; db_clean "$W/$MANYDB2"
 MANY2SRC="$W/bb_many_src"; mkdir -p "$MANY2SRC"
 # seq -w yields zero-padded strings ("0008") which printf %d parses as OCTAL →
-# error → set -e death. The padded string needs no reformat.
+# error → set -e death (soak finding F-9g). The padded string needs no reformat.
 for i in $(seq -w 1 1000); do printf "f%s" "$i" > "$MANY2SRC/f_$i.txt"; done
 "$BIN" "$W/$MANYDB2" init >/dev/null 2>&1
 "$BIN" "$W/$MANYDB2" backup "$MANY2SRC" / >/dev/null 2>&1 || die "backup 1000 small files"

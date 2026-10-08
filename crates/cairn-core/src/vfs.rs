@@ -208,8 +208,7 @@ impl Vfs {
             // archives; opaque hash fallback without the private key).
             let name = self
                 .engine
-                .resolve_dentry_name(&name_key, name_enc.as_deref())
-                .into_string();
+                .resolve_dentry_name(&name_key, name_enc.as_deref());
             if let Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec)) =
                 self.getattr_raw(entry_ino).await?
             {

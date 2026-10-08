@@ -4,6 +4,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+mod shared_dedup;
+
 /// generate an unpredictable temp file path in the given directory.
 /// Uses 16 hex chars from OsRng (64 bits of entropy) so an attacker cannot
 /// guess the name before the file is created.
@@ -91,6 +93,25 @@ fn check_format_version(stored: Option<&str>) -> Result<()> {
         anyhow::bail!("archive format_version {on_disk} is invalid (minimum is 1)");
     }
     Ok(())
+}
+
+/// Derive the non-secret deduplication contract solely from archive-pinned
+/// configuration.  A partial pool configuration is corruption, not an
+/// invitation to quietly use archive-local equality.
+fn dedup_contract(
+    mode: &str,
+    shared_domain: Option<&str>,
+    shared_namespace: Option<&str>,
+) -> Result<(&'static str, &'static str)> {
+    match (mode, shared_domain, shared_namespace) {
+        ("random", None, None) => Ok(("none", "none")),
+        ("enabled", Some(_), Some(_)) => Ok(("pool", "blake3-keyed/pool-v1")),
+        ("enabled", None, None) => Ok(("archive", "blake3-keyed/archive-v1")),
+        ("random" | "enabled", _, _) => {
+            anyhow::bail!("incomplete shared-dedup configuration in archive")
+        }
+        (other, _, _) => anyhow::bail!("unsupported dedup_mode {other:?}"),
+    }
 }
 
 #[derive(Serialize)]
@@ -594,6 +615,11 @@ struct Args {
     #[arg(long, global = true)]
     cache_dir: Option<String>,
 
+    /// File holding the shared-dedup domain secret. Required when opening an
+    /// archive configured for shared dedup if its stored path is unavailable.
+    #[arg(long, global = true)]
+    shared_dedup_secret_file: Option<std::path::PathBuf>,
+
     /// Maximum local cache size in megabytes (0 = unlimited)
     #[arg(long, default_value_t = 0, global = true)]
     cache_limit_mb: u64,
@@ -680,6 +706,7 @@ struct Args {
     db_busy_timeout_ms: u32,
 
     /// `pool.get()` deadline in seconds. 0 = wait forever (DoS risk under
+    /// `pool.get()` deadline in seconds. 0 = wait forever (DoS risk under
     /// slow disk). `CAIRN_DB_CONNECTION_TIMEOUT_SECS`.
     #[arg(
         long,
@@ -758,6 +785,21 @@ enum Commands {
         /// the archive and cannot be flipped later.
         #[arg(long)]
         disable_dedup: bool,
+        /// Keep this archive out of a selected pool while retaining ordinary
+        /// archive-local deduplication.  This is the privacy boundary switch;
+        /// it is fixed at init and never silently changed on reopen.
+        #[arg(long, conflicts_with = "shared_dedup_domain")]
+        disable_shared_dedup: bool,
+        /// Shared-dedup domain id (BF-02): enables opt-in cross-archive
+        /// deduplication within this domain. Requires --shared-dedup-secret-file;
+        /// the two flags must come together and conflict with --disable-dedup.
+        /// Only the derived non-secret namespace is stored in the archive.
+        #[arg(long)]
+        shared_dedup_domain: Option<String>,
+        /// Directory shared by every archive in this domain. It holds the
+        /// canonical ciphertext and the atomic domain mappings.
+        #[arg(long)]
+        shared_dedup_store_dir: Option<std::path::PathBuf>,
         /// Ransomware hardening: forbid gc / snapshot rm / snapshot prune forever
         /// (cannot be disabled through the CLI once set)
         #[arg(long)]
@@ -776,17 +818,15 @@ enum Commands {
         /// for throwaway/test archives — short passwords are GPU-brute-forceable.
         #[arg(long)]
         allow_weak_password: bool,
-        /// Store file/dir/symlink names in PLAINTEXT instead of the default
-        /// hidden-names behavior. On by default (this flag opts OUT) whenever
-        /// the archive is asymmetric (--pub-key) with a password: dentry
-        /// lookup keys become keyed hashes and the real names are stored
-        /// age-encrypted (write-only: only the private key reads them). Fixed
-        /// at init, like --disable-dedup. Does NOT hide tree shape, sizes,
-        /// mtimes, or xattr values — see HIDE_NAMES.md. Pass this flag to keep
-        /// the old plaintext-names behavior (e.g. for password-only inspection
-        /// of names on a machine without the private key).
+        /// Hide file/dir/symlink NAMES from an untrusted backup host (asymmetric
+        /// archives only). Dentry lookup keys become keyed hashes and the real
+        /// names are stored age-encrypted (write-only: only the private key reads
+        /// them). Requires --pub-key and a password. Fixed at init, like
+        /// --disable-dedup. Does NOT hide tree shape, sizes, mtimes, or xattr
+        /// values — see HIDE_NAMES.md. Opt-in: it trades the password-only
+        /// name-inspection escape hatch for name confidentiality.
         #[arg(long)]
-        plaintext_names: bool,
+        hide_names: bool,
     },
     /// Enable append-only mode (one-way: no CLI path disables it)
     AppendOnly,
@@ -963,11 +1003,15 @@ enum Commands {
 #[derive(Subcommand, Debug)]
 enum SnapshotCommands {
     /// Create a named snapshot of the current archive state
-    Create { name: String },
+    Create {
+        name: String,
+    },
     /// List all snapshots
     Ls,
     /// Delete a snapshot by ID
-    Rm { id: u64 },
+    Rm {
+        id: u64,
+    },
     /// Rollback archive to a specific snapshot (EXCLUSIVE lock; replaces the DB file).
     /// Non-atomic window is documented in ARCHITECTURE — never run on the sole copy
     /// without a prior offline DB copy. Use `--i-accept-non-atomic` to proceed.
@@ -996,6 +1040,11 @@ enum SnapshotCommands {
         /// years). 0 = rule does not apply.
         #[arg(long)]
         keep_yearly: Option<usize>,
+        /// Trusted checkpoint to explicitly re-anchor after this intentional
+        /// history deletion. Required when the current checkpointed snapshot
+        /// would be removed.
+        #[arg(long, value_name = "PATH")]
+        checkpoint: Option<String>,
     },
     /// Compare two snapshots and show added/removed/modified files
     Diff {
@@ -1003,6 +1052,34 @@ enum SnapshotCommands {
         from: u64,
         /// Second snapshot ID
         to: u64,
+    },
+    /// Export one frozen snapshot and its opaque ciphertext objects as a portable bundle.
+    Export {
+        id: u64,
+        dest: String,
+    },
+    /// Validate a portable bundle and import its ciphertext objects into this archive cache.
+    Import {
+        bundle: String,
+    },
+    /// Build a JSON deletion plan from an external JSON array of snapshot IDs.
+    DeletePlan {
+        ids_file: String,
+        #[arg(long)]
+        allow_empty_history: bool,
+    },
+    /// Atomically apply a previously generated deletion plan.
+    DeleteApply {
+        plan: String,
+    },
+    Protect {
+        id: u64,
+        #[arg(long)]
+        off: bool,
+    },
+    Tags {
+        id: u64,
+        tags_json: String,
     },
 }
 
@@ -1021,6 +1098,25 @@ struct SnapshotStat {
     id: u64,
     name: String,
     timestamp: u64,
+    protected: bool,
+    tags: serde_json::Value,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotDeletePlan {
+    api_version: u8,
+    archive_id: String,
+    history_revision: u64,
+    ids: Vec<u64>,
+    allow_empty_history: bool,
+}
+
+#[derive(serde::Serialize)]
+struct SnapshotList {
+    api_version: u8,
+    archive_id: String,
+    history_revision: u64,
+    snapshots: Vec<SnapshotStat>,
 }
 
 /// Remove a file only if it is NOT a symlink (TOCTOU symlink-attack guard).
@@ -1244,12 +1340,47 @@ async fn main() -> Result<()> {
             max_upload_speed_mb,
             inline_max_size,
             disable_dedup,
+            disable_shared_dedup,
+            shared_dedup_domain,
+            shared_dedup_store_dir,
             append_only,
             force,
             allow_plaintext_index,
             allow_weak_password,
-            plaintext_names,
+            hide_names,
         } => {
+            // D01: resolve (and thereby validate) the shared-dedup pair BEFORE
+            // any archive mutation -- absent/partial/conflicting/secret-file
+            // errors abort init with nothing written. The secret is only held
+            // in memory; the archive persists the NON-secret namespace.
+            let shared_dedup = if *disable_shared_dedup {
+                None
+            } else {
+                shared_dedup::resolve(
+                    shared_dedup_domain.as_deref(),
+                    args.shared_dedup_secret_file.as_deref(),
+                    *disable_dedup,
+                    // Background/long-running processes: the domain secret comes
+                    // from the environment, not from a per-invocation file.  It is
+                    // consumed in-memory only (never stored).
+                    std::env::var("CAIRN_SHARED_DEDUP_SECRET")
+                        .ok()
+                        .map(|s| s.into_bytes()),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?
+            };
+            if shared_dedup.is_some() && shared_dedup_store_dir.is_none() {
+                anyhow::bail!(
+                    "--shared-dedup-domain requires --shared-dedup-store-dir: \
+                     archives in the domain must use one common filesystem store"
+                );
+            }
+            if shared_dedup.is_some() && args.shared_dedup_secret_file.is_none() {
+                anyhow::bail!(
+                    "--shared-dedup-domain requires --shared-dedup-secret-file: \
+                     the path is retained as an archive-local secret source for later writes"
+                );
+            }
             // A deliberately low CAIRN_KDF_ITER (< the 50k secure floor) marks a
             // throwaway/test archive — the production password policies below
             // don't apply there, so the test suite's short/absent
@@ -1288,24 +1419,31 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            // On by default whenever the archive supports it (asymmetric +
-            // password), --plaintext-names opts out. Neither condition is an
-            // error when unmet by default — only --plaintext-names is a user
-            // choice; a symmetric archive or a missing password just can't
-            // support hiding. See docs/DESIGN-NOTES.md#2.
-            let hide_names = if *plaintext_names || args.pub_key.is_none() {
-                false
-            } else if password.is_none() {
-                tracing::warn!(
-                    "hide-names is on by default for asymmetric archives but was skipped: no \
-                     password given, so the name-hashing secret would have nowhere safe to \
-                     live. Names will be stored in plaintext. Set a password to enable name \
-                     hiding, or pass --plaintext-names to silence this warning."
-                );
-                false
-            } else {
-                true
-            };
+            // --hide-names is only meaningful, and only safe, in the
+            // untrusted-host (asymmetric) model WITH an encrypted index:
+            //   * asymmetric (--pub-key): real names are age-encrypted write-only,
+            //     so the pub-key-only host cannot read them back. In symmetric
+            //     mode the host holds the password → it could decrypt names →
+            //     hiding would be defeated.
+            //   * encrypted index (password): the name-hashing secret lives under
+            //     the SQLCipher password. A plaintext index would expose it, so
+            //     storage theft could confirm-by-guess — breaking the guarantee.
+            if *hide_names {
+                if args.pub_key.is_none() {
+                    anyhow::bail!(
+                        "--hide-names requires an asymmetric archive (--pub-key). In symmetric \
+                         (password-only) mode the backup host holds the password and could \
+                         decrypt the names, which would defeat name hiding."
+                    );
+                }
+                if password.is_none() {
+                    anyhow::bail!(
+                        "--hide-names requires a password: the name-hashing secret is stored in \
+                         the encrypted index. Without a password the index (and that secret) \
+                         would be plaintext, letting storage theft confirm names by guessing."
+                    );
+                }
+            }
             // CLI validation: fail-loud on bogus enum-like values
             // and unbounded numerics. The previous pass silently accepted any
             // string for `comp_algo` and any `usize` for `inline_max_size`,
@@ -1426,22 +1564,53 @@ async fn main() -> Result<()> {
             // the dedup mode is part of the archive's on-disk identity —
             // mixing convergent and random chunks in one archive would poison
             // dedup accounting, so it is fixed at init (a re-init needs --force,
-            // which wipes the data anyway). "convergent" (default) = keyed-BLAKE3
-            // content-derived chunk keys; "random" = fresh random key per chunk.
+            // which wipes the data anyway). "enabled" means keyed content IDs
+            // for lookup while each physical object still has a random DEK and
+            // nonce; "random" disables every dedup lookup.
             db.set_config(
                 "dedup_mode",
-                if *disable_dedup {
-                    "random"
-                } else {
-                    "convergent"
-                },
+                if *disable_dedup { "random" } else { "enabled" },
             )?;
-            // A fresh keyed-hash secret under the SQLCipher password; its
-            // presence marks the archive as name-hiding. Fixed at init.
-            if hide_names {
+            // --hide-names: a fresh random keyed-hash secret, stored under the
+            // SQLCipher password like dedup_secret. Its PRESENCE marks the archive
+            // as name-hiding; the open path loads it into the CryptoCtx. Fixed at
+            // init — there is no CLI path to add/remove it later (a re-init needs
+            // --force, which wipes the data).
+            if *hide_names {
                 let mut name_secret = [0u8; 32];
                 rand::rngs::OsRng.fill_bytes(&mut name_secret);
                 db.set_config("name_hash_secret", &hex::encode(name_secret))?;
+            }
+            // This is format metadata, not a secret and not a content hash.
+            // It lets an operator see exactly which equality domain the index
+            // used during restore/audit; a reader must never infer it from a
+            // ciphertext object ID.
+            let (dedup_scope, dedup_id_scheme) = if *disable_dedup {
+                ("none", "none")
+            } else if shared_dedup.is_some() {
+                ("pool", "blake3-keyed/pool-v1")
+            } else {
+                ("archive", "blake3-keyed/archive-v1")
+            };
+            db.set_config("dedup_scope", dedup_scope)?;
+            db.set_config("dedup_id_scheme", dedup_id_scheme)?;
+            // D01: persist only the derived non-secret shared identity.  The
+            // domain secret itself never touches disk; a later read of these
+            // keys by backup/restore is D03's job.
+            if let Some(sh) = &shared_dedup {
+                db.set_config("dedup_shared_domain", &sh.domain_id)?;
+                db.set_config("dedup_shared_namespace", &sh.namespace)?;
+                db.set_config(
+                    "dedup_shared_store_dir",
+                    shared_dedup_store_dir
+                        .as_ref()
+                        .expect("validated with shared_dedup")
+                        .to_string_lossy()
+                        .as_ref(),
+                )?;
+                if let Some(path) = &args.shared_dedup_secret_file {
+                    db.set_config("dedup_shared_secret_file", &path.to_string_lossy())?;
+                }
             }
             if *append_only {
                 db.set_config("append_only", "true")?;
@@ -1582,31 +1751,42 @@ async fn main() -> Result<()> {
     } else if has_kek {
         anyhow::bail!("This archive is symmetric (password-only); do not pass --pub-key.");
     }
-    let dedup_secret_val = match db.get_config("dedup_secret")? {
-        Some(v) => v,
-        None => {
-            // emit a warning when dedup_secret is missing and
-            // being regenerated. A missing secret means old chunks were hashed
-            // with a different (or absent) secret → they will NEVER deduplicate
-            // against new writes. The operator needs to know this is happening.
-            tracing::warn!(
-                "dedup_secret missing from DB config — generating new one. \
-                 Existing chunks will NOT deduplicate against new writes. \
-                 This typically means the DB was manually edited or corrupted."
-            );
-            use rand::RngCore;
-            let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
-            let hex = hex::encode(bytes);
-            db.set_config("dedup_secret", &hex)?;
-            hex
-        }
-    };
+    let dedup_secret_val = db.get_config("dedup_secret")?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "archive has no dedup_secret; refusing to generate a new equality domain during open"
+        )
+    })?;
     let dedup_secret_opt = Some(secrecy::SecretString::new(dedup_secret_val.into()));
 
-    // the dedup mode is read from the archive config, never from a flag.
-    // Absent key (legacy archive) = convergent, the only mode that existed.
-    let disable_dedup = db.get_config("dedup_mode")?.as_deref() == Some("random");
+    // The dedup mode and equality-domain contract are archive-pinned.  There
+    // are no real pre-contract archives, so an absent/unknown value is
+    // corruption rather than a reason to guess a weaker fallback.
+    let dedup_mode = db
+        .get_config("dedup_mode")?
+        .ok_or_else(|| anyhow::anyhow!("archive has no dedup_mode"))?;
+    let disable_dedup = dedup_mode == "random";
+
+    // D01 persisted only the NON-secret shared identity; the domain secret
+    // itself never left the init process's memory.
+    let shared_domain = db.get_config("dedup_shared_domain")?;
+    let shared_namespace = db.get_config("dedup_shared_namespace")?;
+    let (expected_scope, expected_scheme) = dedup_contract(
+        &dedup_mode,
+        shared_domain.as_deref(),
+        shared_namespace.as_deref(),
+    )?;
+    let stored_scope = db
+        .get_config("dedup_scope")?
+        .ok_or_else(|| anyhow::anyhow!("archive has no dedup_scope"))?;
+    let stored_scheme = db
+        .get_config("dedup_id_scheme")?
+        .ok_or_else(|| anyhow::anyhow!("archive has no dedup_id_scheme"))?;
+    if stored_scope != expected_scope || stored_scheme != expected_scheme {
+        anyhow::bail!(
+            "dedup contract mismatch: archive records {stored_scope}/{stored_scheme}, \
+             configuration requires {expected_scope}/{expected_scheme}"
+        );
+    }
 
     // --hide-names: load the (optional) name-hashing secret. Present only in
     // archives created with `init --hide-names`; it lives under the SQLCipher
@@ -1925,6 +2105,25 @@ async fn main() -> Result<()> {
     } else {
         Some(operators[0].clone())
     };
+
+    // D03b: a shared-dedup archive must run only on backends that can
+    // provide atomic conditional publication. Whether the archive is opened
+    // for backup or restore, refuse loudly instead of silently degrading to
+    // check-then-write races (design §6, D00 review condition 2).
+    if let (Some(domain), Some(namespace)) = (&shared_domain, &shared_namespace) {
+        if !cairn_store::shared_dedup::shared_dedup_supported(&operators) {
+            anyhow::bail!(
+                "Archive participates in shared-dedup domain `{domain}` (namespace {namespace}) \
+                 but the configured backends cannot provide atomic get-or-create for shared \
+                 records — refusing to run in shared mode. Use isolated archive dedup \
+                 or a filesystem-only backend."
+            );
+        }
+        tracing::info!(
+            "shared-dedup: archive participates in domain `{domain}` (namespace {namespace}) — \
+             cross-archive dedup active for identical content in this domain"
+        );
+    }
 
     // dedup_secret is stored as PLAINTEXT hex (inside the already-SQLCipher-
     // encrypted DB). It must NOT be KEK-encrypted at rest: the load path reads it
@@ -2400,6 +2599,14 @@ async fn main() -> Result<()> {
 
             let snapshots = db.list_snapshots().unwrap_or_default();
             let unique_chunks = db.get_all_used_chunks().unwrap_or_default().len();
+            let dedup_scope = db
+                .get_config("dedup_scope")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "unknown (legacy archive)".to_string());
+            let dedup_id_scheme = db
+                .get_config("dedup_id_scheme")
+                .unwrap_or(None)
+                .unwrap_or_else(|| "unknown (legacy archive)".to_string());
 
             let mut cache_bytes = 0;
             let cache_path = std::path::Path::new(&cache_dir_base);
@@ -2447,6 +2654,8 @@ async fn main() -> Result<()> {
                     upload_pending: u64,
                     upload_inflight: usize,
                     append_only: bool,
+                    dedup_scope: String,
+                    dedup_id_scheme: String,
                 }
                 let dedup_ratio = if physical_bytes > 0 {
                     (logical_bytes as f64) / (physical_bytes as f64)
@@ -2459,6 +2668,12 @@ async fn main() -> Result<()> {
                         id,
                         name,
                         timestamp,
+                        protected: db.snapshot_control(id).map(|v| v.0).unwrap_or(false),
+                        tags: db
+                            .snapshot_control(id)
+                            .ok()
+                            .and_then(|v| serde_json::from_str(&v.1).ok())
+                            .unwrap_or(serde_json::Value::Array(vec![])),
                     })
                     .collect();
                 let st = StatusJson {
@@ -2474,6 +2689,8 @@ async fn main() -> Result<()> {
                     upload_pending: pending,
                     upload_inflight: 128 - inflight,
                     append_only,
+                    dedup_scope,
+                    dedup_id_scheme,
                 };
                 println!("{}", serde_json::to_string(&st).unwrap_or_default());
                 return Ok(());
@@ -2490,6 +2707,8 @@ async fn main() -> Result<()> {
             println!("  Unique data chunks:   {unique_chunks} (out of {chunks} total)");
             println!("  Physical size (dedup):{physical_bytes} bytes");
             println!("  Local cache size:     {cache_bytes} bytes");
+            println!("  Dedup scope:          {dedup_scope}");
+            println!("  Dedup ID scheme:      {dedup_id_scheme}");
 
             if physical_bytes > 0 && logical_bytes > 0 {
                 println!(
@@ -2560,7 +2779,8 @@ async fn main() -> Result<()> {
         }
         Commands::Snapshot { cmd: snap_cmd } => match snap_cmd {
             SnapshotCommands::Ls => {
-                let snapshots = db.list_snapshots().unwrap_or_default();
+                let history = db.snapshot_history()?;
+                let snapshots = history.snapshots;
                 if args.json {
                     let snaps: Vec<SnapshotStat> = snapshots
                         .into_iter()
@@ -2568,9 +2788,23 @@ async fn main() -> Result<()> {
                             id,
                             name,
                             timestamp,
+                            protected: db.snapshot_control(id).map(|v| v.0).unwrap_or(false),
+                            tags: db
+                                .snapshot_control(id)
+                                .ok()
+                                .and_then(|v| serde_json::from_str(&v.1).ok())
+                                .unwrap_or(serde_json::Value::Array(vec![])),
                         })
                         .collect();
-                    println!("{}", serde_json::to_string(&snaps).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string(&SnapshotList {
+                            api_version: 1,
+                            archive_id: history.archive_id,
+                            history_revision: history.revision,
+                            snapshots: snaps
+                        })?
+                    );
                 } else {
                     println!("--- Snapshots ---");
                     println!("  Total snapshots:      {}", snapshots.len());
@@ -2632,7 +2866,8 @@ async fn main() -> Result<()> {
                 if !snapshots.iter().any(|(sid, _, _)| sid == id) {
                     anyhow::bail!("Snapshot #{id} not found (see `snapshot ls`)");
                 }
-                db.delete_snapshot(*id)?;
+                let deleted = db.delete_snapshot(*id)?;
+                debug_assert!(deleted.is_some(), "existence checked above");
             }
             SnapshotCommands::Rollback {
                 id,
@@ -2714,6 +2949,7 @@ async fn main() -> Result<()> {
                 keep_weekly,
                 keep_monthly,
                 keep_yearly,
+                checkpoint,
             } => {
                 if let Some(reason) = destroy_block {
                     anyhow::bail!("Refused: {reason} (snapshot prune deletes history).");
@@ -2797,6 +3033,25 @@ async fn main() -> Result<()> {
                             println!("Deleted snapshot #{id}");
                         }
                     }
+                }
+                if let Some(path) = checkpoint {
+                    let remaining = db.list_snapshots()?;
+                    let newest = remaining
+                        .iter()
+                        .max_by_key(|(id, _, _)| id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "cannot re-anchor checkpoint: prune removed every snapshot"
+                            )
+                        })?;
+                    engine
+                        .recheckpoint_after_prune(newest.0, std::path::Path::new(&path))
+                        .await?;
+                    println!("Re-anchored trusted checkpoint at snapshot #{}.", newest.0);
+                } else {
+                    println!(
+                        "Checkpoint was not changed; if a deleted snapshot was checkpointed, verification will refuse until you explicitly re-anchor it."
+                    );
                 }
             }
             SnapshotCommands::Diff { from, to } => {
@@ -2989,6 +3244,71 @@ async fn main() -> Result<()> {
                 let _ = std::fs::remove_file(&tmp_to);
                 let _ = std::fs::remove_file(format!("{}-wal", tmp_to));
                 let _ = std::fs::remove_file(format!("{}-shm", tmp_to));
+            }
+            SnapshotCommands::Export { id, dest } => {
+                engine
+                    .export_snapshot_bundle(*id, std::path::Path::new(dest))
+                    .await?;
+                println!("Exported snapshot #{id} to {dest}.");
+            }
+            SnapshotCommands::Import { bundle } => {
+                let id = cairn_core::CairnEngine::import_snapshot_bundle(
+                    std::path::Path::new(bundle),
+                    std::path::Path::new(&cache_dir_base),
+                )
+                .await?;
+                println!("Imported ciphertext objects for snapshot #{id} into the local cache.");
+            }
+            SnapshotCommands::DeletePlan {
+                ids_file,
+                allow_empty_history,
+            } => {
+                let ids: Vec<u64> = serde_json::from_slice(&std::fs::read(ids_file)?)?;
+                let history = db.snapshot_history()?;
+                let known: std::collections::HashSet<u64> =
+                    history.snapshots.iter().map(|s| s.0).collect();
+                if ids.iter().any(|id| !known.contains(id)) {
+                    anyhow::bail!("unknown snapshot id in plan");
+                }
+                if ids.len() != ids.iter().collect::<std::collections::HashSet<_>>().len() {
+                    anyhow::bail!("duplicate snapshot id in plan");
+                }
+                if !*allow_empty_history && ids.len() >= history.snapshots.len() {
+                    anyhow::bail!("EMPTY_HISTORY_FORBIDDEN");
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string(&SnapshotDeletePlan {
+                        api_version: 1,
+                        archive_id: history.archive_id,
+                        history_revision: history.revision,
+                        ids,
+                        allow_empty_history: *allow_empty_history
+                    })?
+                );
+            }
+            SnapshotCommands::DeleteApply { plan } => {
+                if let Some(reason) = destroy_block {
+                    anyhow::bail!("Refused: {reason} (snapshot delete applies history deletion).");
+                }
+                let plan: SnapshotDeletePlan = serde_json::from_slice(&std::fs::read(plan)?)?;
+                if plan.api_version != 1 {
+                    anyhow::bail!("unsupported delete-plan version");
+                }
+                let deleted = db.apply_snapshot_delete_plan(
+                    &plan.archive_id,
+                    plan.history_revision,
+                    &plan.ids,
+                    plan.allow_empty_history,
+                )?;
+                println!("{}", serde_json::to_string(&deleted)?);
+            }
+            SnapshotCommands::Protect { id, off } => {
+                db.set_snapshot_control(*id, Some(!*off), None)?;
+            }
+            SnapshotCommands::Tags { id, tags_json } => {
+                let _: Vec<String> = serde_json::from_str(tags_json)?;
+                db.set_snapshot_control(*id, None, Some(tags_json))?;
             }
         },
         Commands::Gc { grace_period_hours } => {
@@ -4278,7 +4598,26 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARCHIVE_FORMAT_VERSION, check_format_version};
+    use super::{ARCHIVE_FORMAT_VERSION, check_format_version, dedup_contract};
+
+    #[test]
+    fn dedup_contract_has_only_three_explicit_equality_domains() {
+        assert_eq!(
+            dedup_contract("random", None, None).unwrap(),
+            ("none", "none")
+        );
+        assert_eq!(
+            dedup_contract("enabled", None, None).unwrap(),
+            ("archive", "blake3-keyed/archive-v1")
+        );
+        assert_eq!(
+            dedup_contract("enabled", Some("team-a"), Some("namespace")).unwrap(),
+            ("pool", "blake3-keyed/pool-v1")
+        );
+        assert!(dedup_contract("enabled", Some("team-a"), None).is_err());
+        assert!(dedup_contract("random", Some("team-a"), Some("namespace")).is_err());
+        assert!(dedup_contract("unknown", None, None).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

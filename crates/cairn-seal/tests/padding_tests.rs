@@ -38,14 +38,11 @@ fn make_ctx() -> (CryptoCtx, TempDir) {
 #[test]
 fn t045_aligned_input_no_extra_padding() {
     let (ctx, _tmp) = make_ctx();
-    let sym_key = vec![0x42u8; 32];
-
     // 4096-byte input (aligned to 4096)
     let plaintext = vec![0xABu8; 4096];
 
-    let (ciphertext, _comp_type) = ctx
-        .encrypt_chunk_symmetric(&plaintext, &sym_key, Some("none"))
-        .unwrap();
+    let sealed = ctx.seal_chunk(&plaintext, Some("none")).unwrap();
+    let ciphertext = sealed.ciphertext;
 
     // ciphertext = nonce(12) + encrypted(padded_data + trailer(4)) + tag(16)
     // padded_data = plaintext + pad_len
@@ -71,14 +68,11 @@ fn t045_aligned_input_no_extra_padding() {
 #[test]
 fn t045_unaligned_input_correct_padding() {
     let (ctx, _tmp) = make_ctx();
-    let sym_key = vec![0x42u8; 32];
-
     // 100-byte input — should be padded to 4096
     let plaintext = vec![0xCDu8; 100];
 
-    let (ciphertext, _comp_type) = ctx
-        .encrypt_chunk_symmetric(&plaintext, &sym_key, Some("none"))
-        .unwrap();
+    let sealed = ctx.seal_chunk(&plaintext, Some("none")).unwrap();
+    let ciphertext = sealed.ciphertext;
 
     let nonce_len = 12;
     let tag_len = 16;
@@ -97,13 +91,10 @@ fn t045_unaligned_input_correct_padding() {
 #[test]
 fn t045_double_aligned_no_extra_padding() {
     let (ctx, _tmp) = make_ctx();
-    let sym_key = vec![0x42u8; 32];
-
     let plaintext = vec![0xEFu8; 8192];
 
-    let (ciphertext, _comp_type) = ctx
-        .encrypt_chunk_symmetric(&plaintext, &sym_key, Some("none"))
-        .unwrap();
+    let sealed = ctx.seal_chunk(&plaintext, Some("none")).unwrap();
+    let ciphertext = sealed.ciphertext;
 
     let nonce_len = 12;
     let tag_len = 16;

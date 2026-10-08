@@ -48,9 +48,8 @@ eliminates the convergence oracle entirely (at the cost of deduplication; the mo
   `/proc/PID/environ` to same-uid attackers).
 - **Not anti-forensic.** A machine holding the keys can read the data; there is no self-destruct or deniability.
 - **Metadata at rest.** File names, sizes and structure are protected only by SQLCipher (`--password`). A leaked
-  password exposes them, unless names are hidden — the default on asymmetric+password archives (`init
-  --plaintext-names` opts out): names become write-only (keyed hashes + age-encrypted, readable only with the private
-  key); sizes, tree,
+  password exposes them. Backup hosts *hold* this password by design. **Optional:** `init --hide-names` (asymmetric
+  archives) makes *names* write-only (keyed hashes + age-encrypted, readable only with the private key); sizes, tree,
   timestamps and xattr values are unaffected. See `HIDE_NAMES.md`.
 - **Restore host trust.** Only mount with `--priv-key` on machines you trust — that is where the data becomes readable.
 - **`--dangerously-skip-verify`.** Requires `CAIRN_I_ACCEPT_CORRUPTION=1` in addition to the flag; otherwise refused.

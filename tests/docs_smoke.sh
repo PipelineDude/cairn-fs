@@ -4,7 +4,7 @@
 # Every cairn invocation below is copy-pasted from README.md / OPERATING.md with
 # only paths/passwords substituted. If you change an example in the docs, change
 # it here too — this gate exists because the docs once drifted into sequences
-# that failed at every step (flag order, init without password,
+# that failed at every step (FINDINGS F-4: flag order, init without password,
 # key model pinned at init).
 #
 # Usage: tests/docs_smoke.sh [path-to-cairn-binary]

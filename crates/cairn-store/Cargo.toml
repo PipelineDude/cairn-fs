@@ -11,10 +11,13 @@ cacache = "13"
 leaky-bucket = "1.1.2"
 anyhow = "1.0"
 tracing = "0.1.44"
-opendal = { version = "0.58.1", features = ["services-s3", "services-gcs"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+opendal = { version = "0.58.1", features = ["services-s3", "services-gcs", "services-fs"], optional = true }
 reed-solomon-erasure = { version = "6.0.0", optional = true }
 futures = "0.3.32"
 blake3 = "1.8.5"
+zeroize = "1.7"
 tokio = { version = "1.52.3", features = ["rt"] }
 async-trait = "0.1"
 

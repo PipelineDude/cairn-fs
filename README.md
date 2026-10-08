@@ -5,25 +5,10 @@
 
 Cairn is a cross-platform backup engine and FUSE filesystem for **reliable, encrypted, deduplicated backups**. It sets itself apart from restic/borg/kopia with two key properties (full comparison: [`COMPARISON.md`](COMPARISON.md)):
 
-1. **Asymmetric (public/private-key) envelope encryption.** You back up with only a *public* key — which is safe to keep on any machine, server, or CI runner — and that machine can **never read the file *content* it backed up** (chunked *and* inline). Restoring content requires the *private* key, held only on a trusted machine. **Write-only means content-only:** the backup host still holds the DB *password* (required to write the index), so it can see **metadata** — names, sizes, tree, xattr values — but not content. *File names* are write-only too by default for asymmetric+password archives (keyed hashes + age-encrypted, readable only with the private key; sizes/tree/timestamps/xattrs still visible — pass `init --plaintext-names` to opt out — see [`HIDE_NAMES.md`](HIDE_NAMES.md)). See `THREAT_MODEL.md`. Pre-1.0: **no external cryptographic audit** yet (`COMPARISON.md`).
+1. **Asymmetric (public/private-key) envelope encryption.** You back up with only a *public* key — which is safe to keep on any machine, server, or CI runner — and that machine can **never read the file *content* it backed up** (chunked *and* inline). Restoring content requires the *private* key, held only on a trusted machine. **Write-only means content-only:** the backup host still holds the DB *password* (required to write the index), so it can see **metadata** — names, sizes, tree, xattr values — but not content. Optionally, `init --hide-names` makes *file names* write-only too (keyed hashes + age-encrypted, readable only with the private key; sizes/tree/timestamps/xattrs still visible — see [`HIDE_NAMES.md`](HIDE_NAMES.md)). See `THREAT_MODEL.md`. Pre-1.0: **no external cryptographic audit** yet (`COMPARISON.md`).
 2. **Live Filesystem Mount.** Mount an encrypted, deduplicated backup as a normal read/write filesystem and browse/edit it in place, not just extract it. **Linux (fuse3) is the tested, supported target.** (A cross-platform `fuser` adapter existed earlier but has been removed; Windows/macOS support is a roadmap item, not a current feature.)
 
 Under the hood: FastCDC content-defined chunking + dedup, zstd/lz4 compression, AES-256-GCM / ChaCha20-Poly1305 chunk encryption with per-chunk keys wrapped by an age X25519 recipient, a SQLCipher metadata index, and snapshots.
-
-```mermaid
-graph TD
-    User((User)) -->|CLI / GUI / FUSE| Core[cairn-core<br/>Main engine]
-    
-    subgraph "Cairn architecture"
-        Core --> CDC[cairn-cdc<br/>FastCDC chunking / dedup]
-        Core --> Seal[cairn-seal<br/>X25519 / AES-GCM encryption]
-        Core --> Index[(cairn-index<br/>SQLCipher metadata)]
-        Core --> Store[cairn-store<br/>Storage backends]
-    end
-    
-    Store -->|opendal| Disk[(Local disk)]
-    Store -->|opendal| Cloud[(S3 / GCS / Azure)]
-```
 
 > **Storage: local disk or cloud, with multi-cloud RAID.** The default backend is your local disk. Cairn also supports S3, GCS, Azure Blob, and network drives, including RAID-0/1/5/6/10 across multiple cloud providers. Build with `--no-default-features` for an offline, local-only binary with no network stack.
 
@@ -102,7 +87,6 @@ gen_keys combine priv.pem share_1.bin share_3.bin   # rebuild from any 2 (shares
 Distribute the shares across separate custody (people/locations/safes). Losing the **`--password`** locks the
 metadata index the same way. Neither the key nor the password can be reset — a backup tool cannot keep an escape
 hatch that an attacker could also use.
-
 
 **Initialize an archive:**
 ```bash
@@ -253,7 +237,7 @@ All limits have safe defaults; raise them on big-RAM machines for faster bulk wr
 |---|---|
 | `init --force` | Overwrites an existing DB (DESTRUCTIVE: wipes all files, snapshots and cached chunks). |
 | `init --disable-dedup` | Random per-chunk keys — maximum privacy, no deduplication. Fixed at init. |
-| `init --plaintext-names` | Opt out of the default name-hiding on asymmetric+password archives (keeps real names visible to anyone with the password, like a symmetric archive). Fixed at init. See [`HIDE_NAMES.md`](HIDE_NAMES.md). |
+| `init --hide-names` | Hide file names from an untrusted backup host (asymmetric archives only; keyed hashes + age-encrypted names). Fixed at init. Sizes/tree/timestamps/xattrs still visible. See [`HIDE_NAMES.md`](HIDE_NAMES.md). |
 | `extract --glob 'pattern'` | Extracts only matching paths (mutually exclusive with the literal `--file-path`). |
 | `backup --exclude 'pattern'` | Excludes matching files from backup. Pattern is validated at startup. |
 | `snapshot prune --keep-daily N` | GFS retention (with `--keep-weekly/--keep-monthly/--keep-yearly`). `0` = rule not applied. |

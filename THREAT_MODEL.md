@@ -20,8 +20,8 @@ backup **cannot decrypt file contents** — it has no private key. Restoring con
 **Scope of "write-only": content only.** The backup host still holds the **index password**, so it can list and
 read **metadata** (names, sizes, tree, xattr values). It is *not* "gets nothing." See Out of scope → Metadata.
 
-> **By default on asymmetric+password archives** (`init --plaintext-names` opts out), *file/dir/symlink names* are
-> removed from this list — they become keyed hashes plus write-only age-encrypted blobs, so the backup host can no longer read or enumerate them
+> **Optional: `init --hide-names`** (asymmetric archives only) removes *file/dir/symlink names* from this list — they
+> become keyed hashes plus write-only age-encrypted blobs, so the backup host can no longer read or enumerate them
 > (it can still *confirm a specific guess*, since it holds the name-hashing secret). It does **not** hide tree shape,
 > sizes, mtimes, hardlink topology, or **xattr values**. Opt-in, fixed at init. See `HIDE_NAMES.md`.
 
@@ -51,7 +51,7 @@ untrusted backup hosts; symmetric mode is for a trusted machine backing up to un
   backup host, which holds the password, can see it — but never file *content*, which is envelope-encrypted). Chunk sizes
   can leak coarse information about content. If xattr values are themselves sensitive, do not rely on the write-only
   property to hide them — they are protected at the metadata (password) level, like file names, not the content level.
-  *Names* specifically get write-only hiding by default on asymmetric+password archives (see `HIDE_NAMES.md`); sizes, tree,
+  *Names* specifically can be upgraded to write-only hiding with `init --hide-names` (see `HIDE_NAMES.md`); sizes, tree,
   timestamps, hardlink topology and **xattr values** remain at the metadata level even then.
 - **Convergent-dedup confirmation attacks.** An attacker who obtains the archive's dedup secret (it lives in the
   SQLCipher config, so this requires the index password) and a candidate file can test whether that file is present

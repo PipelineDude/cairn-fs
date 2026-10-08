@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# Cairn hide-names end-to-end — the CLI-level gate that `cargo test` cannot reach.
+# Cairn --hide-names end-to-end — the CLI-level gate that `cargo test` cannot reach.
 #
 # The engine tests (crates/cairn-core/tests/hide_names_tests.rs) cover the crypto
 # and FS surface by constructing a CryptoCtx directly. They do NOT exercise the
-# main.rs wiring: the default-on decision, generating + storing name_hash_secret
+# main.rs wiring: the init validation gates, generating + storing name_hash_secret
 # under the SQLCipher password, and loading it back into the ctx on open. This
 # script drives the real binary through init → backup → extract to prove that path.
-#
-# Name hiding is ON BY DEFAULT for asymmetric archives with a password (no flag
-# needed); --plaintext-names opts out. A symmetric archive or a missing password
-# just can't support it — silently, not an error (see docs/DESIGN-NOTES.md#2).
 #
 # No FUSE required (backup/extract are enough), so it is fast and CI-friendly.
 #
@@ -36,32 +32,30 @@ cd "$W"
 export CAIRN_KDF_ITER="${CAIRN_KDF_ITER:-1000}"   # test speed: low KDF (throwaway data)
 PW='hide-names-e2e-pw-123'
 
-echo "== default-on decision =="
+echo "== init --hide-names validation gates =="
 
-# 1. asymmetric + password, no flag → hidden by default
-env CAIRN_PASSWORD="$PW" "$BIN" hn.db --pub-key pub.pem init >/dev/null 2>&1 \
-    && say "init accepted (asymmetric + password, hidden by default)" \
-    || fail "init refused a valid asymmetric+password archive"
+# 1. asymmetric + password → accepted
+env CAIRN_PASSWORD="$PW" "$BIN" hn.db --pub-key pub.pem init --hide-names >/dev/null 2>&1 \
+    && say "init --hide-names accepted (asymmetric + password)" \
+    || fail "init --hide-names refused a valid asymmetric+password archive"
 
-# 2. symmetric (no --pub-key) → succeeds, but names cannot be hidden (no error)
-env CAIRN_PASSWORD="$PW" "$BIN" sym.db init >/dev/null 2>&1 \
-    && say "init on a symmetric archive still succeeds (hiding just doesn't apply)" \
-    || fail "init on a symmetric archive was refused (should silently skip hiding, not error)"
-
-# 3. asymmetric but NO password → succeeds with a warning, not an error
-if env -u CAIRN_PASSWORD "$BIN" np.db --pub-key pub.pem init >"$W/g3.log" 2>&1; then
-    grep -qi 'skipped: no password' "$W/g3.log" && say "init without a password warns and skips hiding (no error)" \
-        || fail "passwordless asymmetric init succeeded, but without the expected warning"
+# 2. symmetric (no --pub-key) → refused (host holds the password, could decrypt names)
+if env CAIRN_PASSWORD="$PW" "$BIN" sym.db init --hide-names >"$W/g2.log" 2>&1; then
+    fail "init --hide-names was allowed on a SYMMETRIC archive"
 else
-    fail "init without a password was refused (should warn and proceed with plaintext names)"
+    grep -qi 'asymmetric' "$W/g2.log" && say "init --hide-names refuses symmetric mode" \
+        || fail "symmetric --hide-names refused, but without the asymmetric-required message"
 fi
 
-# 4. explicit opt-out
-env CAIRN_PASSWORD="$PW" "$BIN" plain.db --pub-key pub.pem init --plaintext-names >/dev/null 2>&1 \
-    && say "init --plaintext-names accepted (explicit opt-out)" \
-    || fail "init --plaintext-names was refused"
+# 3. asymmetric but NO password → refused (name_secret would be plaintext)
+if env -u CAIRN_PASSWORD "$BIN" np.db --pub-key pub.pem init --hide-names >"$W/g3.log" 2>&1; then
+    fail "init --hide-names was allowed WITHOUT a password"
+else
+    grep -qi 'requires a password' "$W/g3.log" && say "init --hide-names refuses a passwordless archive" \
+        || fail "passwordless --hide-names refused, but without the password-required message"
+fi
 
-echo "== backup → extract round-trip (real config path, hidden by default) =="
+echo "== backup → extract round-trip (real config path) =="
 mkdir -p src/sub
 printf 'quarterly numbers 42' > "src/SECRET_report.txt"
 printf 'deep secret'          > "src/sub/nested_SECRET.txt"
@@ -87,17 +81,6 @@ if find "$W/out_pubonly" | grep -q 'SECRET'; then
 else
     say "pub-only extract yields no real names (hashes only)"
 fi
-
-echo "== --plaintext-names archive keeps names in plaintext =="
-mkdir -p src_plain out_plain
-printf 'visible content' > "src_plain/VISIBLE_name.txt"
-env CAIRN_PASSWORD="$PW" "$BIN" plain.db --pub-key pub.pem backup "$W/src_plain" / >/dev/null 2>&1 \
-    || die "backup into --plaintext-names archive failed"
-env CAIRN_PASSWORD="$PW" "$BIN" plain.db --pub-key pub.pem --priv-key priv.pem extract "$W/out_plain" >/dev/null 2>&1 \
-    || die "extract from --plaintext-names archive failed"
-[ -f "$W/out_plain/VISIBLE_name.txt" ] \
-    && say "--plaintext-names archive: real name visible without a private key" \
-    || fail "--plaintext-names archive did not preserve the plaintext name"
 
 echo "== verify runs on a hide-names archive =="
 env CAIRN_PASSWORD="$PW" "$BIN" hn.db --pub-key pub.pem --priv-key priv.pem verify >/dev/null 2>&1 \

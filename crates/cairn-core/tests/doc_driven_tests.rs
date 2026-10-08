@@ -289,16 +289,27 @@ fn doc_append_only_gc_refused_without_grace() -> Result<()> {
     let db = cairn_index::Db::new(db_path.to_str().unwrap(), pwd.as_ref())?;
 
     // Insert a chunk that was just created (not yet past grace period).
-    // Schema requires plaintext_hash + sym_key NOT NULL; created_at is
-    // unixtime set slightly in the past so (now - created_at) > 0 at grace=0.
+    // The merged schema requires plaintext_hash + sym_key (both NOT NULL) and
+    // stores created_at as an epoch integer.
     let conn = db.pool.get()?;
     conn.execute(
-        "INSERT INTO chunk_index (object_id, plaintext_hash, sym_key, comp_type, cipher, created_at) \
-         VALUES (?1, ?2, X'00', 0, 'aes256gcm', strftime('%s', 'now', '-100 seconds'))",
-        ["fresh_chunk", "fresh-hash"],
+        "INSERT INTO chunk_index (object_id, plaintext_hash, sym_key, created_at)
+         VALUES (?1, ?2, ?3, strftime('%s','now'))",
+        ("fresh_chunk", "ph-fresh", vec![0u8; 1]),
     )?;
 
-    // With grace_period_hours=0, it should be returned as orphan.
+    // Grace is strict: a chunk created in this very second is NOT an orphan yet.
+    let orphans = db.get_orphaned_chunks(0)?;
+    assert!(
+        !orphans.contains(&"fresh_chunk".to_string()),
+        "a just-created chunk must not be an orphan under a strict grace boundary"
+    );
+
+    // Once it is older than the grace period it becomes an orphan.
+    conn.execute(
+        "UPDATE chunk_index SET created_at = strftime('%s','now') - 3600 WHERE object_id = 'fresh_chunk'",
+        [],
+    )?;
     let orphans = db.get_orphaned_chunks(0)?;
     assert!(orphans.contains(&"fresh_chunk".to_string()));
 

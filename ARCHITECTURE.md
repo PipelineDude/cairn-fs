@@ -62,9 +62,8 @@ Dependency direction is strictly downward: `main → cairn-fuse → cairn-core �
   with no server-side state. Rowids don't shift on concurrent create/unlink (unlike `LIMIT/OFFSET`), and
   the same cookie must be used by BOTH calls — the kernel may start a listing via readdirplus and continue
   via plain readdir (READDIRPLUS_AUTO), which is exactly how a per-call cursor map breaks.
-- **Name hiding (default on asymmetric+password archives; `--plaintext-names` opts out).** The
-  `dentries.name` column is a *lookup key*: the plaintext name in `--plaintext-names`/symmetric
-  archives (byte-identical layout), or `BLAKE3-keyed(name_secret, LE64(parent)‖name)`
+- **`--hide-names` (optional, asymmetric archives).** The `dentries.name` column is a *lookup key*: the
+  plaintext name in normal archives (byte-identical layout), or `BLAKE3-keyed(name_secret, LE64(parent)‖name)`
   when hiding. A second column `name_enc` holds the age-encrypted real name (write-only, `NULL` in normal
   archives). The engine translates `name → name_lookup_key(parent,name)` at every keyed boundary (lookup,
   unlink, rename, link, insert) and decrypts `name_enc` on read paths (readdir/extract); both are the

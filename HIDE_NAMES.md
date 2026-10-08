@@ -1,4 +1,4 @@
-# Hiding file names from an untrusted backup host
+# `--hide-names` — hiding file names from an untrusted backup host
 
 By default Cairn encrypts file **contents** (asymmetric mode: only the private key
 reads them) but stores **metadata** — names, sizes, tree, timestamps, xattrs — in a
@@ -6,33 +6,23 @@ SQLCipher index that the backup host must open with the `--password`. So a backu
 host, or anyone who leaks the index, can read your **file names** even though it can
 never read file *content*.
 
-Cairn closes the *names* part of that gap **by default**, whenever the archive is
-asymmetric (`--pub-key`) with a password — no flag needed. Pass `--plaintext-names`
-to opt out and keep the old behavior (real names visible to anyone with the
-password). Either way it is **fixed at init** (like `--disable-dedup`): there is no
-CLI path to add or remove it on an existing archive.
+`init --hide-names` closes the *names* part of that gap. It is **opt-in** and
+**fixed at init** (like `--disable-dedup`): there is no CLI path to add or remove it
+on an existing archive.
 
 ```bash
-# names hidden by default; content write-only; requires a pub key AND a password
-CAIRN_PASSWORD=… cairn --archive a.db --pub-key pub.pem init
-
-# opt out: real names stay visible to anyone with the password (old default)
-CAIRN_PASSWORD=… cairn --archive a.db --pub-key pub.pem init --plaintext-names
+# names hidden; content write-only; requires a pub key AND a password
+CAIRN_PASSWORD=… cairn --archive a.db --pub-key pub.pem init --hide-names
 ```
 
-## When hiding applies
+## Requirements
 
-Hiding only ever turns on when BOTH hold; neither missing condition is an error —
-`init` just proceeds without hiding (a warning on the password path, since that one
-is easy to hit by accident):
-
-- **Asymmetric** (`--pub-key`). In symmetric mode the host holds the password and
-  could decrypt the names — hiding would be pointless — so a symmetric `init` never
-  hides names, `--plaintext-names` or not.
+- **Asymmetric only** (`--pub-key`). In symmetric mode the host holds the password
+  and could decrypt the names — hiding would be pointless — so `init --hide-names`
+  refuses without a public key.
 - **A password.** The per-archive name-hashing secret lives in the encrypted index.
   Without a password the index (and that secret) would be plaintext, so storage
-  theft could confirm names by guessing. `init` without a password warns and
-  proceeds with plaintext names instead of hiding them.
+  theft could confirm names by guessing. `init --hide-names` refuses without one.
 
 ## How it works
 
@@ -53,12 +43,9 @@ Each directory entry is stored as two columns instead of one plaintext name:
   show the real names; `lookup` matches by the keyed hash.
 - **Public-key-only host:** `readdir` shows the opaque hashes; content and names stay
   unreadable. The archive still *opens* (graceful degradation — it does not hard-fail).
-  `extract` in this state writes files under those hashes and warns loudly per file —
-  see "What it hides" below for why that is worth noticing, not just accepting.
 
-`--plaintext-names` archives (and symmetric archives) are **byte-identical** to
-name-hiding's absence before this feature existed: the lookup column holds the
-plaintext name and `name_enc` is `NULL`.
+Normal archives (without `--hide-names`) are **byte-identical** to before: the lookup
+column holds the plaintext name and `name_enc` is `NULL`.
 
 ## What it hides — and what it does NOT
 
@@ -74,8 +61,8 @@ plaintext name and `name_enc` is `NULL`.
 - **file sizes** — via chunk count/sizes (4 KiB padding only smooths them).
 - **mtimes** — used for incremental change detection.
 - **hardlink topology** — N names sharing one inode is visible (only the *names* are hidden).
-- **xattr values** — hiding does **not** touch extended attributes. If xattr
-  values are sensitive, do not rely on a hide-names archive to hide them too.
+- **xattr values** — `--hide-names` does **not** touch extended attributes. If xattr
+  values are sensitive, do not store them in a `--hide-names` archive expecting them hidden.
 
 **Confirm-by-guess.** The backup host holds `name_secret`, so it can test a *specific*
 guess — compute `keyed_BLAKE3(name_secret, parent ‖ "passwords.txt")` and look for that
@@ -84,13 +71,11 @@ already suspects.* Storage theft **without** the password cannot even do that �
 is keyed and irreversible. Making even confirm-by-guess impossible would require keeping
 `name_secret` off the host (KMS/HSM), which breaks incremental-by-path; out of scope.
 
-## Disaster-recovery cost (why `--plaintext-names` exists)
+## Disaster-recovery cost (why it is opt-in)
 
-With names hidden, the password alone shows only hashes; reconstructing real names
-needs the **private key** (the same key content already needs, so no *new* hard
-single-point-of-failure — but you do lose the password-only name-inspection escape
-hatch: without `--plaintext-names` you cannot inspect the tree with a stock `sqlite3`
-client using just the password, for recovery/debugging). `--plaintext-names` restores
-that escape hatch by keeping real names visible to anyone with the password, same as
-before this feature existed. Pick it deliberately if you rely on password-only
-inspection more than you need name confidentiality from the backup host.
+Without `--hide-names`, the password alone recovers real names — you can inspect the
+tree with a stock `sqlite3` client for recovery/debugging. With `--hide-names`, the
+password alone shows only hashes; reconstructing real names needs the **private key**
+(the same key content already needs, so no *new* hard single-point-of-failure — but you
+do lose the password-only name-inspection escape hatch). A backup tool is
+recoverability-first, so this trade-off must be a deliberate choice, not a default.

@@ -2,8 +2,12 @@
 // crate's `crate::CloudOperator` paths keep resolving.
 pub use cairn_store::CloudOperator;
 
+pub mod shared;
+
 use anyhow::Result;
 use fastcdc::v2020::FastCDC;
+
+use crate::shared::{SharedDedupConfig, publish_shared_chunk};
 
 #[derive(Debug)]
 pub struct ChunkResult {
@@ -39,6 +43,7 @@ impl Chunker {
         raid_mode: String,
         async_upload: bool,
         comp_algo_override: Option<String>,
+        shared: Option<SharedDedupConfig>,
     ) -> Result<Vec<ChunkResult>> {
         if data.is_empty() {
             return Ok(Vec::new());
@@ -64,6 +69,7 @@ impl Chunker {
                     let crypto_ref = crypto.clone();
                     let db_ref = db_arc_for_map.clone();
                     let comp_override = comp_algo_override.clone();
+                    let shared_cfg = shared.clone();
                     #[cfg(feature = "cloud-storage")]
                     let store = store.clone();
                     #[cfg(feature = "cloud-storage")]
@@ -79,42 +85,11 @@ impl Chunker {
                             ));
                         }
                         let chunk_data = &data_ref[offset..offset + len];
-                        let plaintext_hash = {
-                            // clone the secret out of the mutex
-                            // quickly, then drop the guard BEFORE the CPU-heavy
-                            // blake3 hash. Holding std::sync::Mutex across an
-                            // async task blocks the tokio worker thread.
-                            // the clone is `Zeroizing` so the dedup secret
-                            // does not linger on the heap after the hash.
-                            let ds_clone: Option<zeroize::Zeroizing<Vec<u8>>> = {
-                                let ds_guard = crypto_ref.dedup_secret.lock();
-                                ds_guard.as_ref().map(|ds| {
-                                    use secrecy::ExposeSecret;
-                                    zeroize::Zeroizing::new(ds.expose_secret().as_bytes().to_vec())
-                                })
-                            };
-                            if let Some(ref ds_bytes) = ds_clone {
-                                let mut hasher = blake3::Hasher::new();
-                                hasher.update(ds_bytes);
-                                hasher.update(chunk_data);
-                                hasher.finalize().to_hex().to_string()
-                            } else if crypto_ref.disable_dedup {
-                                // random-key mode: this hash is not used for dedup.
-                                blake3::hash(chunk_data).to_hex().to_string()
-                            } else {
-                                // convergent mode with no secret = a write
-                                // after zeroize_keys. Fail loud rather than store an
-                                // UNKEYED hash that can never match future lookups.
-                                return Err(anyhow::anyhow!(
-                                    "dedup_secret unavailable (already zeroized?) — \
-                                     cannot hash chunk for dedup"
-                                ));
-                            }
-                        };
+                        let content_id = crypto_ref.content_id(chunk_data)?;
+                        let plaintext_hash = content_id
+                            .map(|id| blake3::Hash::from(id).to_hex().to_string());
 
-                        let db_res = if crypto_ref.disable_dedup {
-                            Ok(None)
-                        } else {
+                        let db_res = if let Some(ref plaintext_hash) = plaintext_hash {
                             let db = db_ref.clone();
                             let ph = plaintext_hash.clone();
                             // JoinHandle::Err can indicate a
@@ -130,6 +105,8 @@ impl Chunker {
                                     ));
                                 }
                             }
+                        } else {
+                            Ok(None)
                         };
 
                         // match the three outcomes of a dedup
@@ -140,7 +117,7 @@ impl Chunker {
                         match db_res {
                             Ok(Some((object_id, _sym_key, comp_type))) => {
                                 return Ok::<
-                                    (ChunkResult, Option<(String, String, Vec<u8>, i32, String)>),
+                                    (ChunkResult, Option<(String, String, Vec<u8>, i32, String, bool)>),
                                     anyhow::Error,
                                 >((
                                     ChunkResult {
@@ -159,24 +136,55 @@ impl Chunker {
                             }
                         }
 
-                        // 1. Encrypt chunk asymmetrically (actually symmetrically)
-                        //    The plaintext chunk key is secret material — zeroize
-                        //    it on drop (hardened the read path; this closes
-                        //    the write-side gap so keys never linger on the heap).
-                        //    generate_chunk_key now returns
-                        //    Result<Zeroizing<Vec<u8>>> directly — no double wrap.
-                        let sym_key = crypto_ref.generate_chunk_key(chunk_data)
-                            .map_err(|e| anyhow::anyhow!("Chunk key generation failed: {e}"))?;
-                        let (ciphertext, comp_type) = crypto_ref
-                            .encrypt_chunk_symmetric(chunk_data, &sym_key, comp_override.as_deref())
-                            .map_err(|e| anyhow::anyhow!("Crypto error: {e}"))?;
+                        // D03: shared-domain write.  When a domain is configured
+                        // (and convergent dedup is on), produce the canonical
+                        // domain object instead of an archive-scope one:
+                        // seal_chunk_shared (double wrap) → publish_or_adopt →
+                        // index the WINNER with the DOMAIN-wrapped record and
+                        // flag it `domain`.
+                        if let Some(cfg) = &shared_cfg {
+                            let outcome = publish_shared_chunk(
+                                chunk_data,
+                                &crypto_ref,
+                                comp_override.as_deref(),
+                                cfg,
+                                &dir,
+                            )
+                            .await?;
+                            let oid = outcome.object_id.clone();
+                            let shared_cid = {
+                                let cid = cairn_store::shared_dedup::shared_content_id(
+                                    &cfg.domain_id,
+                                    &cfg.domain_secret,
+                                    chunk_data,
+                                );
+                                cid.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                            };
+                            return Ok((
+                                ChunkResult {
+                                    hash_key: oid.clone(),
+                                    plain_len: len,
+                                    offset,
+                                    comp_type: outcome.comp_type as i32,
+                                    dedup_hit: outcome.dedup_hit,
+                                },
+                                Some((
+                                    oid,
+                                    shared_cid,
+                                    outcome.record.sealed_meta.wrapped_key,
+                                    outcome.comp_type as i32,
+                                    outcome.record.sealed_meta.cipher_algo,
+                                    true,
+                                )),
+                            ));
+                        }
 
-                        let wrapped_key = crypto_ref
-                            .encrypt_blob(&sym_key)
-                            .map_err(|e| anyhow::anyhow!("Envelope error: {e}"))?;
-
-                        // 2. Hash the ciphertext for object_id
-                        let hash = blake3::hash(&ciphertext).to_hex().to_string();
+                        let cairn_seal::SealedChunk {
+                            object_id: hash, wrapped_key, comp_type, cipher_algo, ciphertext, ..
+                        } = crypto_ref.seal_chunk(chunk_data, comp_override.as_deref())?;
+                        // The schema keeps this column non-null even when no dedup
+                        // lookup occurs. A random physical ID is never a plaintext ID.
+                        let plaintext_hash = plaintext_hash.unwrap_or_else(|| hash.clone());
 
                         // 3. Write ciphertext to cacache without per-chunk fsync
                         cacache::write(&dir, &hash, &ciphertext)
@@ -302,7 +310,7 @@ impl Chunker {
 
                         // 4. Return new chunk meta to be inserted in batch
                         Ok::<
-                            (ChunkResult, Option<(String, String, Vec<u8>, i32, String)>),
+                            (ChunkResult, Option<(String, String, Vec<u8>, i32, String, bool)>),
                             anyhow::Error,
                         >((
                             ChunkResult {
@@ -317,7 +325,8 @@ impl Chunker {
                                 plaintext_hash,
                                 wrapped_key,
                                 i32::from(comp_type),
-                                crypto_ref.crypto_algo.clone(),
+                                cipher_algo,
+                                false,
                             )),
                         ))
                     })
@@ -338,13 +347,18 @@ impl Chunker {
         // error so the caller still sees the failure.
         let mut final_results = Vec::with_capacity(results.len());
         let mut new_chunks = Vec::new();
+        let mut domain_oids = Vec::new();
         let mut first_err = None;
         for r in results {
             match r {
                 Ok((chunk_res, new_meta)) => {
                     final_results.push(chunk_res);
                     if let Some(meta) = new_meta {
-                        new_chunks.push(meta);
+                        let (oid, ph, sk, ct, algo, domain_flag) = meta;
+                        new_chunks.push((oid.clone(), ph, sk, ct, algo));
+                        if domain_flag {
+                            domain_oids.push(oid);
+                        }
                     }
                 }
                 Err(e) => {
@@ -357,18 +371,14 @@ impl Chunker {
 
         if !new_chunks.is_empty() {
             let db_ref = db.clone();
-            match tokio::task::spawn_blocking(move || {
-                db_ref.insert_chunk_indices_batch(&new_chunks)
-            })
-            .await
-            {
-                Ok(res) => res?,
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "spawn_blocking in batch insert failed: {e}"
-                    ));
-                }
-            };
+            tokio::task::spawn_blocking(move || db_ref.insert_chunk_indices_batch(&new_chunks))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking in batch insert failed: {e}"))??;
+            // D03: mark the domain-mode chunks so reads use the shared
+            // reader path instead of the archive path.
+            for oid in &domain_oids {
+                db.set_chunk_domain(oid, true)?;
+            }
         }
 
         // completed chunks are now indexed (gc-visible); surface the error.
@@ -396,34 +406,31 @@ mod tests {
         opendal::Operator,
         tempfile::TempDir,
     ) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let uri = format!("file:test_cdc_{}?mode=memory&cache=shared", id);
-
-        let db = cairn_index::Db::new(&uri, None).unwrap();
+        // File-backed SQLite so concurrent writers exercise real busy-timeout
+        // handling instead of the cross-connection artefacts of
+        // `mode=memory&cache=shared`. The TempDir is returned alongside so the
+        // db file (and its WAL) has a known lifetime for the test body.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = cairn_index::Db::new(db_path.to_str().unwrap(), None).unwrap();
         let db = Arc::new(db);
 
-        let identity_file = tempfile::NamedTempFile::new().unwrap();
-        let pub_key_file = tempfile::NamedTempFile::new().unwrap();
+        let identity_file = temp_dir.path().join("identity.txt");
+        let pub_key_file = temp_dir.path().join("pubkey.txt");
 
         let identity = age::x25519::Identity::generate();
         use secrecy::ExposeSecret;
         std::fs::write(
-            identity_file.path(),
+            &identity_file,
             identity.to_string().expose_secret().as_bytes(),
         )
         .unwrap();
-        std::fs::write(
-            pub_key_file.path(),
-            identity.to_public().to_string().as_bytes(),
-        )
-        .unwrap();
+        std::fs::write(&pub_key_file, identity.to_public().to_string().as_bytes()).unwrap();
 
         let crypto = Arc::new(
             cairn_seal::CryptoCtx::new(
-                pub_key_file.path().to_str().unwrap(),
-                Some(identity_file.path().to_str().unwrap()),
+                pub_key_file.to_str().unwrap(),
+                Some(identity_file.to_str().unwrap()),
                 3,
                 0,
                 "zstd".to_string(),
@@ -434,8 +441,6 @@ mod tests {
             )
             .unwrap(),
         );
-
-        let temp_dir = tempfile::tempdir().unwrap();
 
         let builder = opendal::services::Memory::default();
         let op = opendal::Operator::new(builder).unwrap();
@@ -462,6 +467,7 @@ mod tests {
             "raid1".to_string(),
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -484,6 +490,7 @@ mod tests {
             store,
             "raid1".to_string(),
             false,
+            None,
             None,
         )
         .await
@@ -516,6 +523,7 @@ mod tests {
             "raid1".to_string(),
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -532,6 +540,7 @@ mod tests {
             store,
             "raid1".to_string(),
             false,
+            None,
             None,
         )
         .await
@@ -557,6 +566,7 @@ mod tests {
             "raid1".to_string(),
             false,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -570,6 +580,7 @@ mod tests {
             store,
             "raid1".to_string(),
             false,
+            None,
             None,
         )
         .await
@@ -593,6 +604,7 @@ mod tests {
             store,
             "raid1".to_string(),
             true,
+            None,
             None,
         )
         .await
@@ -619,6 +631,7 @@ mod tests {
             store,
             "raid5".to_string(),
             false,
+            None,
             None,
         )
         .await;
@@ -648,6 +661,7 @@ mod tests {
             "raid1".to_string(),
             false,
             None,
+            None,
         )
         .await
         .expect("upload should succeed with in-memory store");
@@ -657,5 +671,102 @@ mod tests {
         // Verify the chunk is visible in the index
         let count = db.total_chunks().unwrap();
         assert_eq!(count, chunks.len() as u64);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "cloud-storage")]
+    async fn test_concurrent_writers_leave_consistent_index() {
+        let (db, crypto, store, _op, temp_dir) = setup_test_env_cloud(false).await;
+        let cache_dir = temp_dir.path().to_str().unwrap().to_string();
+        let data = vec![0xABu8; 64 * 1024];
+        let writers = 8;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(writers));
+
+        let mut handles = Vec::new();
+        for _ in 0..writers {
+            let d = data.clone();
+            let cache = cache_dir.clone();
+            let cr = crypto.clone();
+            let dbc = db.clone();
+            let st = store.clone();
+            let start = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                Chunker::process_data(
+                    &d,
+                    &cache,
+                    cr,
+                    dbc,
+                    st,
+                    "raid1".to_string(),
+                    false,
+                    None,
+                    None,
+                )
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(
+                h.await
+                    .expect("writer task must not panic")
+                    .expect("all writers must succeed against the healthy fake cloud store"),
+            );
+        }
+        assert_eq!(results.len(), writers);
+        let chunk_counts: Vec<usize> = results.iter().map(|r| r.len()).collect();
+        assert_eq!(
+            chunk_counts.iter().max().unwrap(),
+            chunk_counts.iter().min().unwrap(),
+            "chunk counts must agree across concurrent identical writers"
+        );
+
+        // Every result handed to a caller must resolve to a durable index row.
+        // A total count cannot prove that property because it could count an
+        // unrelated chunk while one returned object is orphaned.
+        for result in &results {
+            for chunk in result {
+                assert!(
+                    db.chunk_exists(&chunk.hash_key).unwrap(),
+                    "returned object {} is missing from chunk_index",
+                    chunk.hash_key
+                );
+                let stored = cairn_store::ChunkStore::fetch_chunk(
+                    store.as_ref(),
+                    &chunk.hash_key,
+                    "raid1",
+                    false,
+                    false,
+                    true,
+                )
+                .await
+                .expect("each indexed object must be readable from cloud storage");
+                assert_eq!(blake3::hash(&stored).to_hex().as_str(), chunk.hash_key);
+            }
+        }
+
+        // Sequential re-write after the concurrent burst must dedup to a single
+        // already-published object set (B02: repeat write reuses object).
+        let again = Chunker::process_data(
+            &data,
+            &cache_dir,
+            crypto,
+            db,
+            store,
+            "raid1".to_string(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("sequential re-write must succeed");
+        assert_eq!(again.len(), chunk_counts[0]);
+        assert!(
+            results
+                .iter()
+                .any(|r| r.iter().zip(&again).all(|(a, b)| a.hash_key == b.hash_key)),
+            "sequential repeat must reuse one of the concurrently published objects"
+        );
     }
 }

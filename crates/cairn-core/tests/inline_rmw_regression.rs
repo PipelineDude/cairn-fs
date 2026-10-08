@@ -304,3 +304,60 @@ async fn inline_truncate_extend_past_threshold_zero_fills() {
         "inline extend past threshold lost content / didn't zero-fill"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_and_symlink_use_sealed_containers_and_reject_tampering() {
+    let (engine, _dir) = setup_engine().await;
+    let req = Request::default();
+    let ino = mk(&engine, &req).await;
+    let data = b"small inline payload";
+
+    engine
+        .write(req.clone(), ino, 0, 0, data, 0, 0)
+        .await
+        .unwrap();
+    engine.fsync(req.clone(), ino, 0, false).await.unwrap();
+
+    let stored = engine.db.get_inline_data(ino).unwrap().unwrap();
+    assert!(
+        stored.starts_with(b"CIN01"),
+        "inline data must use sealed container"
+    );
+    assert_ne!(&stored[..], data);
+    assert_eq!(
+        engine
+            .read(req.clone(), ino, 0, 0, data.len() as u32)
+            .await
+            .unwrap(),
+        data
+    );
+
+    let link = engine
+        .symlink(
+            req.clone(),
+            1,
+            OsStr::new("sealed-link"),
+            OsStr::new("target"),
+        )
+        .await
+        .unwrap()
+        .attr
+        .ino;
+    let link_stored = engine.db.get_inline_data(link).unwrap().unwrap();
+    assert!(
+        link_stored.starts_with(b"CIN01"),
+        "symlink target must use sealed container"
+    );
+    assert_eq!(engine.readlink(req.clone(), link).await.unwrap(), b"target");
+
+    let mut corrupt = stored;
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    engine.db.set_inline_data(ino, &corrupt).unwrap();
+    assert!(
+        engine
+            .read(req, ino, 0, 0, data.len() as u32)
+            .await
+            .is_err()
+    );
+}

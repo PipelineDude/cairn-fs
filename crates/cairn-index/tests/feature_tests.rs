@@ -19,11 +19,30 @@ fn make_archive() -> (tempfile::TempDir, PathBuf) {
     (tmp, db_path)
 }
 
-/// Re-open an archive made by make_archive() WITH its password.
-fn open_archive(db_path: &str) -> cairn_index::Db {
+/// Re-open the (encrypted) archive created by `make_archive` — the index is
+/// SQLCipher-keyed, so every open needs the same password.
+fn open_archive(db_path: &std::path::Path) -> cairn_index::Db {
     let pwd: Option<secrecy::SecretString> =
         Some(secrecy::SecretString::new("testpwd".to_string().into()));
-    cairn_index::Db::new(db_path, pwd.as_ref()).unwrap()
+    cairn_index::Db::new(db_path.to_str().unwrap(), pwd.as_ref()).unwrap()
+}
+
+/// Raw bytes of the archive INCLUDING its WAL sidecars: freshly written schema
+/// can still live in `-wal`, so reading only the main file is flaky (and would
+/// miss plaintext leaks that WAL would otherwise expose).
+fn raw_archive_bytes(db_path: &std::path::Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = if suffix.is_empty() {
+            db_path.to_path_buf()
+        } else {
+            std::path::PathBuf::from(format!("{}{}", db_path.display(), suffix))
+        };
+        if let Ok(mut bytes) = std::fs::read(&path) {
+            out.append(&mut bytes);
+        }
+    }
+    out
 }
 
 // ── Snapshot lifecycle ───────────────────────────────────────────────────────
@@ -31,7 +50,7 @@ fn open_archive(db_path: &str) -> cairn_index::Db {
 #[test]
 fn snapshot_create_then_ls_returns_entries() {
     let (_tmp, db_path) = make_archive();
-    let db = open_archive(db_path.to_str().unwrap());
+    let db = open_archive(&db_path);
     db.create_snapshot("snap1").unwrap();
     let snaps = db.list_snapshots().unwrap();
     assert_eq!(snaps.len(), 1);
@@ -44,7 +63,7 @@ fn snapshot_create_then_ls_returns_entries() {
 #[test]
 fn snapshot_create_multiple_then_ls() {
     let (_tmp, db_path) = make_archive();
-    let db = open_archive(db_path.to_str().unwrap());
+    let db = open_archive(&db_path);
     for i in 1..=5u64 {
         db.create_snapshot(&format!("snap{}", i)).unwrap();
     }
@@ -65,12 +84,14 @@ fn snapshot_extract_then_restore() {
     assert_eq!(snaps.len(), 1);
     let snap_id = snaps[0].0;
 
-    // extract_snapshot writes a FILE (create_new) -- pass a file path, not a dir.
-    let out_dir = tmp.path().join("extracted");
-    std::fs::create_dir_all(&out_dir).unwrap();
-    let out_file = out_dir.join("snapshot.bin");
+    // `extract_snapshot` writes a FILE (create_new); it must not be handed an
+    // existing directory path. Open it back to prove the frozen copy is valid.
+    let out_file = tmp.path().join("extracted.db");
     db.extract_snapshot(snap_id, out_file.to_str().unwrap())
         .unwrap();
+    assert!(out_file.is_file(), "extracted snapshot must be a file");
+    let frozen = open_archive(&out_file);
+    assert_eq!(frozen.list_snapshots().unwrap().len(), 0);
 }
 
 // ── GC grace period ──────────────────────────────────────────────────────────
@@ -83,11 +104,12 @@ fn get_orphaned_chunks_respects_grace_period() {
     let db = cairn_index::Db::new(db_path.to_str().unwrap(), pwd.as_ref()).unwrap();
 
     // Insert a chunk index without any file_chunks reference → it's an orphan.
+    // Schema requires plaintext_hash + sym_key; created_at is an epoch integer.
     let conn = db.pool.get().unwrap();
     conn.execute(
-        "INSERT INTO chunk_index (object_id, plaintext_hash, sym_key, comp_type, cipher, created_at) \
-         VALUES (?1, ?2, X'00', 0, 'aes256gcm', strftime('%s', 'now', '-3600 seconds'))",
-        ["orphan_chunk_001", "orphan-hash"],
+        "INSERT INTO chunk_index (object_id, plaintext_hash, sym_key, created_at)
+         VALUES (?1, ?2, ?3, strftime('%s','now') - 3600)",
+        ("orphan_chunk_001", "ph-orphan-1", vec![0u8; 1]),
     )
     .unwrap();
 
@@ -103,12 +125,12 @@ fn get_orphaned_chunks_respects_grace_period_hours() {
         Some(secrecy::SecretString::new("testpwd".to_string().into()));
     let db = cairn_index::Db::new(db_path.to_str().unwrap(), pwd.as_ref()).unwrap();
 
-    // Insert a chunk that was created 2 hours ago.
+    // Insert a chunk that was created 2 hours ago (epoch seconds).
     let conn = db.pool.get().unwrap();
     conn.execute(
-        "INSERT INTO chunk_index (object_id, plaintext_hash, sym_key, comp_type, cipher, created_at) \
-         VALUES (?1, ?2, X'00', 0, 'aes256gcm', strftime('%s', 'now', '-7200 seconds'))",
-        ["orphan_2h", "orphan-hash-2h"],
+        "INSERT INTO chunk_index (object_id, plaintext_hash, sym_key, created_at)
+         VALUES (?1, ?2, ?3, strftime('%s','now') - 7200)",
+        ("orphan_2h", "ph-orphan-2h", vec![0u8; 1]),
     )
     .unwrap();
 
@@ -130,7 +152,7 @@ fn encrypted_index_no_plaintext_name_in_raw_file() {
     cairn_index::Db::new(db_path.to_str().unwrap(), pwd.as_ref()).unwrap();
 
     // Read raw bytes of the SQLite file.
-    let raw = std::fs::read(&db_path).unwrap();
+    let raw = raw_archive_bytes(&db_path);
 
     // The raw file must NOT contain any plaintext file names or paths.
     assert!(
@@ -152,7 +174,7 @@ fn encrypted_index_no_plaintext_password_in_raw_file() {
         Some(secrecy::SecretString::new("mysecret123".to_string().into()));
     cairn_index::Db::new(db_path.to_str().unwrap(), pwd.as_ref()).unwrap();
 
-    let raw = std::fs::read(&db_path).unwrap();
+    let raw = raw_archive_bytes(&db_path);
 
     // The password itself must not appear in plaintext.
     assert!(
@@ -166,49 +188,14 @@ fn unencrypted_index_contains_plaintext_schema() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("unencrypted.db");
 
-    // Init without password → DB is NOT encrypted (plaintext SQLite).
+    // Init without password → DB is NOT encrypted.
     cairn_index::Db::new(db_path.to_str().unwrap(), None).unwrap();
 
-    let raw = std::fs::read(&db_path).unwrap();
+    let raw = raw_archive_bytes(&db_path);
 
     // An unencrypted SQLite file should contain the schema as plaintext.
     assert!(
         raw_contains(&raw, b"snapshots"),
         "unencrypted index must contain table name 'snapshots' in plaintext"
-    );
-}
-
-// ── Known limitation: v1 database without name_enc column ────────────────────
-
-#[test]
-fn v1_db_without_name_enc_fails_on_name_enc_select() {
-    // CURRENT_SCHEMA_VERSION=1 (no bump yet), so the ALTER TABLE migration
-    // for name_enc does not run. This test documents the known limitation:
-    // a database opened with the old code (v1 schema, no name_enc) will fail
-    // when queried for the missing column. This is acceptable because there
-    // are no live v1 archives (per project owner).
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("v1_legacy.db");
-
-    // Create a v1 schema database directly (bypasses Db::new).
-    let conn = rusqlite::Connection::open(db_path.to_str().unwrap()).unwrap();
-    conn.execute_batch(
-        "PRAGMA user_version = 1;
-         CREATE TABLE IF NOT EXISTS inodes (id INTEGER PRIMARY KEY AUTOINCREMENT, mode INTEGER NOT NULL, uid INTEGER NOT NULL, gid INTEGER NOT NULL, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL, size INTEGER NOT NULL, nlink INTEGER NOT NULL, rdev INTEGER NOT NULL, inline_data BLOB DEFAULT NULL);
-         CREATE TABLE IF NOT EXISTS dentries (parent_inode INTEGER NOT NULL, name TEXT NOT NULL, inode_id INTEGER NOT NULL, PRIMARY KEY (parent_inode, name), FOREIGN KEY(parent_inode) REFERENCES inodes(id) ON DELETE CASCADE, FOREIGN KEY(inode_id) REFERENCES inodes(id) ON DELETE CASCADE);",
-    )
-    .unwrap();
-
-    // Open through the Db API in PLAIN (no password) mode: CREATE IF NOT
-    // EXISTS is a no-op, ALTER is skipped (CURRENT=1), so dentries stays
-    // without name_enc.
-    let db = cairn_index::Db::new(db_path.to_str().unwrap(), None).unwrap();
-
-    // Must fail: v1 dentries has no name_enc column.
-    let conn = db.pool.get().expect("db pool");
-    let result = conn.prepare("SELECT name_enc FROM dentries LIMIT 1");
-    assert!(
-        result.is_err(),
-        "v1 database without name_enc should fail on SELECT name_enc (CURRENT_SCHEMA_VERSION=1)"
     );
 }

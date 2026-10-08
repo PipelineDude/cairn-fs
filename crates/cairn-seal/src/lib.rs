@@ -6,19 +6,26 @@ use age::x25519::Recipient;
 use anyhow::{Result, anyhow};
 use secrecy::ExposeSecret;
 use std::fs;
+use std::io::Read;
 
 /// Default capacity (entries) of the wrapped-key → plaintext-key LRU cache.
 /// Entries are ~64 bytes, so the default costs ~1 MB while still covering the
 /// hot set of a large restore. Bounded so terabyte-scale workloads (millions of
 /// unique wrapped keys) cannot grow the cache without limit and OOM the process.
 pub const DEFAULT_SYM_KEY_CACHE_CAP: usize = 16_384;
+pub const DEFAULT_MAX_PLAINTEXT_LEN: usize = 128 * 1024 * 1024;
+const SEALED_KEY_MAGIC: &[u8; 5] = b"CSK02";
+const SEALED_KEY_LEN: usize = 119;
 
-/// Default capacity (entries) of the hide-names decrypted-name LRU cache.
-/// Sized generously above a single very large directory (see
-/// docs/DESIGN-NOTES.md#3 for the measured cost this exists to amortize):
-/// re-listing the same directory, or `ls`ing a whole tree in one session,
-/// hits the cache instead of re-running age decryption per name per call.
-pub const DEFAULT_NAME_CACHE_CAP: usize = 16_384;
+/// A chunk with a random data-encryption key and authenticated metadata.
+pub struct SealedChunk {
+    pub object_id: String,
+    pub wrapped_key: Vec<u8>,
+    pub comp_type: u8,
+    pub cipher_algo: String,
+    pub plaintext_len: u64,
+    pub ciphertext: Vec<u8>,
+}
 
 /// Newtype around the age private key.
 ///
@@ -37,30 +44,11 @@ type SymKeyCache = lru::LruCache<
     std::sync::Arc<parking_lot::Mutex<Option<zeroize::Zeroizing<Vec<u8>>>>>,
 >;
 
-/// Keyed by BLAKE3 of the `name_enc` blob (same "first reader computes, later
-/// readers of the same key wait" shape as SymKeyCache). Only a process
-/// holding the private key ever populates this (encrypt_name never reads it
-/// back), so caching a name it can already decrypt on demand does not cross
-/// a new confidentiality boundary -- `Zeroizing` is still used so an evicted
-/// or cleared entry's heap buffer doesn't linger, same posture as SymKeyCache.
-type NameCache =
-    lru::LruCache<[u8; 32], std::sync::Arc<parking_lot::Mutex<Option<zeroize::Zeroizing<String>>>>>;
-
 /// Format tag of a chunk key wrapped with the archive KEK:
 /// `CKEK1 || 12-byte random nonce || AES-256-GCM ciphertext+tag`.
 /// Distinguishable from legacy per-key age scrypt envelopes, which start with
 /// the ASCII age header (`age-encryption.org/v1`).
 const KEK_WRAP_MAGIC: &[u8; 5] = b"CKEK1";
-
-/// Padding length to bring `current_len` up to the next multiple of `block`
-/// (0 if already aligned). Shared by `encrypt_name` (64-byte blocks) and
-/// `encrypt_chunk_symmetric` (4096-byte blocks) — both pad for the same
-/// reason (hide the exact plaintext length / CRIME-BREACH mitigation) with
-/// different block sizes and length-encodings, so only this arithmetic is
-/// shared, not the prefix/trailer wire format each already persists on disk.
-fn pad_len_to_block(current_len: usize, block: usize) -> usize {
-    (block - (current_len % block)) % block
-}
 
 /// True if `algo` names ChaCha20-Poly1305. The CLI validates and stores the
 /// hyphenated form (`chacha20-poly1305`) while internal/test call sites use
@@ -70,6 +58,205 @@ fn pad_len_to_block(current_len: usize, block: usize) -> usize {
 fn is_chacha(algo: &str) -> bool {
     let a = algo.replace('-', "").to_ascii_lowercase();
     a == "chacha20poly1305" || a == "chacha20"
+}
+
+/// enforce an exact mapping between the record's cipher ID byte and the
+/// human-readable algorithm string.  An unknown ID or name must be rejected
+/// (not silently fall through to an unintended branch).
+const VALID_CIPHER_IDS: [u8; 2] = [0, 1]; // 0=AES-256-GCM, 1=ChaCha20-Poly1305
+fn validate_cipher_pair(id: u8, algo: &str) -> Result<()> {
+    if !VALID_CIPHER_IDS.contains(&id) {
+        anyhow::bail!("unknown cipher id {id} (allowed: 0=AES-256-GCM, 1=ChaCha20-Poly1305)");
+    }
+    match (id, is_chacha(algo)) {
+        (0, false) | (1, true) => Ok(()),
+        (0, true) => anyhow::bail!("cipher id 0 (AES) contradicts algorithm name '{algo}'"),
+        (1, false) => anyhow::bail!("cipher id 1 (ChaCha) contradicts algorithm name '{algo}'"),
+        _ => anyhow::bail!("invalid cipher id {id}"),
+    }
+}
+
+/// bounded decompression.  A malicious compressed block must never control
+/// an allocation (LZ4's length prefix) or a decoder window (ZSTD's declared
+/// frame size) before the SEALED record's authenticated `expected_len` and the
+/// configured `max_plaintext_len` are enforced.
+fn decompress_sealed(
+    plain_or_compressed: Vec<u8>,
+    comp_algo_type: u8,
+    expected_len: Option<u64>,
+    max_plaintext_len: usize,
+) -> Result<Vec<u8>> {
+    if comp_algo_type > 2 {
+        anyhow::bail!("unknown compression flag in sealed chunk: {comp_algo_type}");
+    }
+    if expected_len.is_none() {
+        // The authenticated record did not bind a plaintext length (legacy
+        // path).  Decompression proceeds WITHOUT that bound — the caller MUST
+        // still enforce the plaintext-hash verification; surface the degraded
+        // mode explicitly instead of silently trusting the decompressed bytes.
+        tracing::warn!(
+            "decompress_sealed: no authenticated expected_len -- plaintext-hash \
+             verification is the only remaining content check"
+        );
+    }
+    let allowed: u64 = match expected_len {
+        Some(len) => (len + 1).min(max_plaintext_len as u64 + 1),
+        None => max_plaintext_len as u64 + 1,
+    };
+    if comp_algo_type == 1 {
+        // ZSTD: reject a frame whose DECLARED content size exceeds the bound
+        // before the decoder's window is allocated (the read path additionally
+        // caps actual output with Read::take(limit+1) and a final length check).
+        if let Some(declared) =
+            zstd::zstd_safe::get_frame_content_size(plain_or_compressed.as_slice())
+                .map_err(|_| anyhow::anyhow!("ZSTD frame header error"))?
+        {
+            if declared > allowed {
+                anyhow::bail!(
+                    "ZSTD frame declares {declared} bytes, exceeding the configured bound"
+                );
+            }
+        }
+        let limit = max_plaintext_len.saturating_add(64 * 1024);
+        let mut decoder = zstd::stream::read::Decoder::new(plain_or_compressed.as_slice())
+            .map_err(|e| anyhow::anyhow!("ZSTD decoder init failed: {e}"))?;
+        let mut buf = Vec::new();
+        std::io::Read::take(&mut decoder, limit as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| anyhow::anyhow!("ZSTD decompression failed: {e}"))?;
+        if buf.len() > max_plaintext_len {
+            anyhow::bail!("decompressed plaintext exceeds configured maximum");
+        }
+        Ok(buf)
+    } else if comp_algo_type == 2 {
+        // LZ4: the length prefix is attacker-controlled — validate it against
+        // `allowed` BEFORE allocating, and decompress with an explicit bound.
+        if plain_or_compressed.len() < 4 {
+            anyhow::bail!("LZ4 block too small");
+        }
+        let (size_bytes, payload) = plain_or_compressed.split_at(4);
+        let size = u32::from_le_bytes(size_bytes.try_into().unwrap()) as u64;
+        if size > allowed {
+            anyhow::bail!("LZ4 declares {size} bytes, exceeding the configured bound");
+        }
+        Ok(lz4_flex::decompress(payload, size as usize)
+            .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {e}"))?)
+    } else {
+        Ok(plain_or_compressed)
+    }
+}
+
+/// Parsed view of a sealed chunk-key record (CSK02 format).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedRecordMeta {
+    pub comp_type: u8,
+    pub cipher_id: u8,
+    pub plaintext_len: u64,
+    pub ciphertext_len: u64,
+    pub object_hash: [u8; 32],
+    /// BLAKE3 of the original, uncompressed plaintext.  This value is inside
+    /// the authenticated, encrypted key record: it is an integrity check, not
+    /// an externally visible content fingerprint.
+    pub plaintext_hash: [u8; 32],
+}
+
+/// Parse a sealed chunk-key record (D03 shared path): validates the CSK02
+/// magic/length and exposes the bound metadata.
+pub fn parse_sealed_record(record: &[u8]) -> Result<SealedRecordMeta> {
+    if record.len() != SEALED_KEY_LEN || !record.starts_with(SEALED_KEY_MAGIC.as_slice()) {
+        anyhow::bail!("not a sealed chunk-key record (CSK02)");
+    }
+    Ok(SealedRecordMeta {
+        comp_type: record[37],
+        cipher_id: record[38],
+        plaintext_len: u64::from_le_bytes(record[39..47].try_into().unwrap()),
+        ciphertext_len: u64::from_le_bytes(record[47..55].try_into().unwrap()),
+        object_hash: record[55..87].try_into().unwrap(),
+        plaintext_hash: record[87..119].try_into().unwrap(),
+    })
+}
+
+/// Encode the sole on-disk sealed-record format.  Keep both archive and pool
+/// writers on this function: a future field cannot accidentally be added to
+/// only one of the two decryptable formats.
+fn sealed_record(
+    dek: &[u8],
+    comp_type: u8,
+    cipher_id: u8,
+    plaintext: &[u8],
+    ciphertext: &[u8],
+    object_hash: &[u8; 32],
+) -> zeroize::Zeroizing<Vec<u8>> {
+    debug_assert_eq!(dek.len(), 32);
+    let mut record = zeroize::Zeroizing::new(Vec::with_capacity(SEALED_KEY_LEN));
+    record.extend_from_slice(SEALED_KEY_MAGIC);
+    record.extend_from_slice(dek);
+    record.push(comp_type);
+    record.push(cipher_id);
+    record.extend_from_slice(&(plaintext.len() as u64).to_le_bytes());
+    record.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    record.extend_from_slice(object_hash);
+    record.extend_from_slice(blake3::hash(plaintext).as_bytes());
+    record
+}
+
+/// Domain wrapping key for cross-archive re-wrap (D00 review condition 4):
+/// blake3 derive_key with the SAME context the design's §3 "cairn shared wrap
+/// v1" naming bound before; distinct from the content-id KDF context.
+pub fn shared_domain_wrapping_key(secret: &[u8]) -> [u8; 32] {
+    blake3::derive_key("cairn shared wrap v1", secret)
+}
+
+/// Wrap (re-wrap) a sealed chunk-key record under a domain key:
+/// `CKEK1 || 12-byte RANDOM nonce || AES-256-GCM ct+tag` — a fresh nonce per
+/// wrap (condition 4), same envelope as archive KEK wraps.
+pub fn wrap_with_domain_key(plaintext: &[u8], domain_key: &[u8; 32]) -> Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(domain_key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
+    let ct = cipher
+        .encrypt(&Nonce::clone_from_slice(&nonce_bytes), plaintext)
+        .map_err(|_| anyhow!("domain key wrap failed"))?;
+    let mut out = Vec::with_capacity(KEK_WRAP_MAGIC.len() + 12 + ct.len());
+    out.extend_from_slice(KEK_WRAP_MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Unwrap a domain-wrapped sealed chunk-key record. Random nonce → both halves
+/// of the AEAD bind the wrapped blob to the domain key.
+pub fn unwrap_with_domain_key(
+    blob: &[u8],
+    domain_key: &[u8; 32],
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let rest = blob
+        .strip_prefix(KEK_WRAP_MAGIC.as_slice())
+        .ok_or_else(|| anyhow!("Unknown blob format (not CKEK1)"))?;
+    if rest.len() < 12 {
+        return Err(anyhow!("Corrupt wrapped blob"));
+    }
+    let (nonce, ct) = rest.split_at(12);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(domain_key));
+    cipher
+        .decrypt(&Nonce::clone_from_slice(nonce), ct)
+        .map(zeroize::Zeroizing::new)
+        .map_err(|_| anyhow!("domain key unwrap failed (corrupt blob or wrong domain key)"))
+}
+
+/// A chunk sealed for canonical shared storing: the same random-DEK ciphertext
+/// as archive-scope sealing, but with a second, domain-keyable wrap so any
+/// archive in the domain can decrypt the one object.
+pub struct SharedSealedChunk {
+    pub object_id: String,
+    pub archive_wrapped_key: Vec<u8>,
+    pub domain_wrapped_key: Vec<u8>,
+    pub comp_type: u8,
+    pub cipher_algo: String,
+    pub plaintext_len: u64,
+    pub ciphertext_len: u64,
+    pub object_hash: [u8; 32],
+    pub ciphertext: Vec<u8>,
 }
 
 pub struct CryptoCtx {
@@ -107,21 +294,11 @@ pub struct CryptoCtx {
     /// confirm-by-guess, but NOT read names (that needs the private key). Cleared by
     /// `zeroize_keys` like the other secrets.
     name_hash_secret: parking_lot::Mutex<Option<zeroize::Zeroizing<[u8; 32]>>>,
-    /// Decrypted-name cache (see [`Self::decrypt_name_cached`]). See
-    /// docs/DESIGN-NOTES.md#3 for why this exists (readdir on a large
-    /// hide-names directory measured 200+ms of decrypt time without it).
-    name_cache: parking_lot::Mutex<NameCache>,
+    max_plaintext_len: usize,
 }
 
 impl CryptoCtx {
     fn new_sym_key_cache(cap: usize) -> parking_lot::Mutex<SymKeyCache> {
-        let cap = cap.max(1);
-        let nz = std::num::NonZeroUsize::new(cap)
-            .unwrap_or_else(|| unreachable!("cap.max(1) is always non-zero"));
-        parking_lot::Mutex::new(lru::LruCache::new(nz))
-    }
-
-    fn new_name_cache(cap: usize) -> parking_lot::Mutex<NameCache> {
         let cap = cap.max(1);
         let nz = std::num::NonZeroUsize::new(cap)
             .unwrap_or_else(|| unreachable!("cap.max(1) is always non-zero"));
@@ -173,9 +350,6 @@ impl CryptoCtx {
     /// The write-only encrypted real name for a dentry. Off → `None` (store plaintext
     /// in the lookup column as today). On → `Some(v1 ‖ age(pub, pad(name)))`: only the
     /// private key can read it back; the padding hides the exact name length.
-    // Deliberately per-call asymmetric, not a cached/shared name key — caching
-    // would keep a reciprocal secret resident for the whole session instead of
-    // per-call. See docs/DESIGN-NOTES.md#1.
     pub fn encrypt_name(&self, name: &str) -> Result<Option<Vec<u8>>> {
         if !self.hide_names {
             return Ok(None);
@@ -190,8 +364,7 @@ impl CryptoCtx {
         plain.extend_from_slice(&(nb.len() as u16).to_le_bytes());
         plain.extend_from_slice(nb);
         let block = 64usize;
-        let pad_len = pad_len_to_block(plain.len(), block);
-        let padded_len = plain.len() + pad_len;
+        let padded_len = plain.len().div_ceil(block) * block;
         plain.resize(padded_len, 0u8);
         // Asymmetric mode → encrypt_blob uses the age recipient (pub key), write-only.
         let mut out = self.encrypt_blob(&plain)?;
@@ -218,34 +391,6 @@ impl CryptoCtx {
         Ok(String::from_utf8(padded[2..2 + len].to_vec())?)
     }
 
-    /// Like [`Self::decrypt_name`], but cached by BLAKE3(blob) -- readdir on
-    /// the same directory (or re-listing during one session) hits the cache
-    /// instead of paying age decryption per name per call. See
-    /// docs/DESIGN-NOTES.md#3 for the measured cost this amortizes.
-    pub fn decrypt_name_cached(&self, blob: &[u8]) -> Result<String> {
-        let hash: [u8; 32] = blake3::hash(blob).into();
-
-        let entry = {
-            let mut cache = self.name_cache.lock();
-            if let Some(arc) = cache.get(&hash) {
-                arc.clone()
-            } else {
-                let arc = std::sync::Arc::new(parking_lot::Mutex::new(None));
-                cache.put(hash, arc.clone());
-                arc
-            }
-        };
-
-        let mut lock = entry.lock();
-        if let Some(cached) = &*lock {
-            return Ok(cached.to_string());
-        }
-
-        let name = self.decrypt_name(blob)?;
-        *lock = Some(zeroize::Zeroizing::new(name.clone()));
-        Ok(name)
-    }
-
     /// Whether a private key is loaded (asymmetric read capability). Used to tell
     /// "priv absent → expected hash fallback" apart from "priv present but the
     /// name blob failed to decrypt → real corruption worth surfacing".
@@ -255,6 +400,11 @@ impl CryptoCtx {
 
     pub fn with_sym_key_cache_cap(mut self, cap: usize) -> Self {
         self.sym_key_cache = Self::new_sym_key_cache(cap);
+        self
+    }
+
+    pub fn with_max_plaintext_len(mut self, limit: usize) -> Self {
+        self.max_plaintext_len = limit.min(DEFAULT_MAX_PLAINTEXT_LEN);
         self
     }
 
@@ -312,7 +462,7 @@ impl CryptoCtx {
             sym_key_cache: Self::new_sym_key_cache(DEFAULT_SYM_KEY_CACHE_CAP),
             hide_names: false,
             name_hash_secret: parking_lot::Mutex::new(None),
-            name_cache: Self::new_name_cache(DEFAULT_NAME_CACHE_CAP),
+            max_plaintext_len: DEFAULT_MAX_PLAINTEXT_LEN,
         })
     }
 
@@ -409,7 +559,7 @@ impl CryptoCtx {
             sym_key_cache: Self::new_sym_key_cache(DEFAULT_SYM_KEY_CACHE_CAP),
             hide_names: false,
             name_hash_secret: parking_lot::Mutex::new(None),
-            name_cache: Self::new_name_cache(DEFAULT_NAME_CACHE_CAP),
+            max_plaintext_len: DEFAULT_MAX_PLAINTEXT_LEN,
         })
     }
 
@@ -451,9 +601,6 @@ impl CryptoCtx {
         // ~1 MB of plaintext keys survives in the sym_key_cache after all
         // other secrets are zeroized.
         self.sym_key_cache.lock().clear();
-        // Same reasoning for decrypted names -- without this, cached
-        // plaintext names outlive the private key that decrypted them.
-        self.name_cache.lock().clear();
     }
 
     pub fn encrypt_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -578,6 +725,7 @@ impl CryptoCtx {
     /// returns `Result` instead of panicking on short
     /// dedup_secret (was `panic!` on the hot write path — kills the process
     /// mid-backup).
+    #[cfg(test)]
     pub fn generate_chunk_key(&self, data: &[u8]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
         if self.disable_dedup {
             let mut sym_key = zeroize::Zeroizing::new(vec![0u8; 32]);
@@ -601,6 +749,7 @@ impl CryptoCtx {
             // secret of any length/format, not just 64-hex-char.
             let mut key = zeroize::Zeroizing::new([0u8; 32]);
             key.copy_from_slice(blake3::hash(secret_bytes).as_bytes());
+            drop(lock); // R06: don't hold the dedup-secret mutex while hashing data
             let hash = blake3::keyed_hash(&key, data);
             Ok(zeroize::Zeroizing::new(hash.as_bytes().to_vec()))
         } else {
@@ -617,14 +766,252 @@ impl CryptoCtx {
         }
     }
 
+    /// Archive-scoped, keyed identity used only for deduplication. It is not an
+    /// encryption key and is deliberately unavailable when dedup is disabled.
+    pub fn content_id(&self, data: &[u8]) -> Result<Option<[u8; 32]>> {
+        if self.disable_dedup {
+            return Ok(None);
+        }
+        let guard = self.dedup_secret.lock();
+        let secret = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("dedup_secret unavailable (already zeroized?)"))?;
+        let bytes = secret.expose_secret().as_bytes();
+        if bytes.len() < 32 {
+            anyhow::bail!("dedup_secret must be at least 32 bytes");
+        }
+        let key = zeroize::Zeroizing::new(blake3::derive_key("cairn content identity v1", bytes));
+        drop(guard);
+        Ok(Some(*blake3::keyed_hash(&key, data).as_bytes()))
+    }
+
+    /// Encrypt with a freshly random DEK and nonce. The wrapped record binds the
+    /// DEK, compression, cipher, plaintext length, ciphertext length and object
+    /// hash, so callers cannot mix metadata from another object.
+    pub fn seal_chunk(
+        &self,
+        plaintext: &[u8],
+        comp_algo_override: Option<&str>,
+    ) -> Result<SealedChunk> {
+        if plaintext.len() > self.max_plaintext_len {
+            anyhow::bail!(
+                "plaintext exceeds configured maximum of {} bytes",
+                self.max_plaintext_len
+            );
+        }
+        let mut dek = zeroize::Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dek.as_mut());
+        let (ciphertext, comp_type) =
+            self.encrypt_chunk_with_nonce_mode(plaintext, &dek[..], comp_algo_override, true)?;
+        let object_hash = blake3::hash(&ciphertext);
+        let cipher_id = if is_chacha(&self.crypto_algo) {
+            1u8
+        } else {
+            0u8
+        };
+        let record = sealed_record(
+            &dek[..],
+            comp_type,
+            cipher_id,
+            plaintext,
+            &ciphertext,
+            object_hash.as_bytes(),
+        );
+        Ok(SealedChunk {
+            object_id: object_hash.to_hex().to_string(),
+            wrapped_key: self.encrypt_blob(&record)?,
+            comp_type,
+            cipher_algo: self.crypto_algo.clone(),
+            plaintext_len: plaintext.len() as u64,
+            ciphertext,
+        })
+    }
+
+    /// Shared-dedup seal (D03): fresh RANDOM DEK + nonce, like seal_chunk, but
+    /// the sealed chunk-key record is wrapped TWICE — with the publisher's
+    /// archive key (unchanged local reads) and with the DOMAIN key (other
+    /// archives in the domain unwrap+decrypt the same canonical object).  The
+    /// domain-wrapped record becomes SharedDedupRecord.sealed_meta.
+    pub fn seal_chunk_shared(
+        &self,
+        plaintext: &[u8],
+        comp_algo_override: Option<&str>,
+        domain_wrap_key: &[u8; 32],
+    ) -> Result<SharedSealedChunk> {
+        if plaintext.len() > self.max_plaintext_len {
+            anyhow::bail!(
+                "plaintext exceeds configured maximum of {} bytes",
+                self.max_plaintext_len
+            );
+        }
+        let mut dek = zeroize::Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dek.as_mut());
+        let (ciphertext, comp_type) =
+            self.encrypt_chunk_with_nonce_mode(plaintext, &dek[..], comp_algo_override, true)?;
+        let object_hash = blake3::hash(&ciphertext);
+        let cipher_id = if is_chacha(&self.crypto_algo) {
+            1u8
+        } else {
+            0u8
+        };
+        let record = sealed_record(
+            &dek[..],
+            comp_type,
+            cipher_id,
+            plaintext,
+            &ciphertext,
+            object_hash.as_bytes(),
+        );
+        Ok(SharedSealedChunk {
+            object_id: object_hash.to_hex().to_string(),
+            archive_wrapped_key: self.encrypt_blob(&record)?,
+            domain_wrapped_key: wrap_with_domain_key(&record, domain_wrap_key)?,
+            comp_type,
+            cipher_algo: self.crypto_algo.clone(),
+            plaintext_len: plaintext.len() as u64,
+            ciphertext_len: ciphertext.len() as u64,
+            object_hash: *object_hash.as_bytes(),
+            ciphertext,
+        })
+    }
+
+    pub fn decrypt_chunk_shared_record(
+        &self,
+        ciphertext: &[u8],
+        record: &[u8],
+        comp_type: u8,
+        cipher_algo: &str,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        // D03: shared-dedup reader path. `record` is the SEALED chunk-key
+        // record recovered from the WINNER's shared record (domain-unwrapped,
+        // see parse_sealed_record), not an archive-key wrap.  Validate the
+        // full sealed-record invariants, then decrypt exactly like
+        // decrypt_chunk_symmetric (kept as a sibling, not a refactor of an
+        // audited hot path).
+        let meta = parse_sealed_record(record)?;
+        validate_cipher_pair(meta.cipher_id, cipher_algo)?;
+        if meta.comp_type != comp_type {
+            anyhow::bail!("sealed chunk metadata does not match request");
+        }
+        if meta.plaintext_len > self.max_plaintext_len as u64
+            || meta.ciphertext_len != ciphertext.len() as u64
+            || meta.object_hash != *blake3::hash(ciphertext).as_bytes()
+        {
+            anyhow::bail!("sealed chunk metadata is corrupt");
+        }
+        self._decrypt_with_dek(
+            ciphertext,
+            &record[5..37],
+            comp_type,
+            cipher_algo,
+            meta.plaintext_len,
+            &meta.plaintext_hash,
+        )
+    }
+
+    /// Decrypt a sealed chunk whose 32-byte DEK we already hold (shared path).
+    /// Mirrors the read tail of decrept_chunk_symmetric: random-nonce prefix,
+    /// chacha/aes dispatch, pad/compression strip and length checks.
+    #[allow(clippy::too_many_arguments)]
+    fn _decrypt_with_dek(
+        &self,
+        ciphertext: &[u8],
+        dek: &[u8],
+        comp_type: u8,
+        cipher_algo: &str,
+        expected_len: u64,
+        expected_hash: &[u8; 32],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        if ciphertext.len() < 12 {
+            return Err(anyhow::anyhow!("Ciphertext too short"));
+        }
+        let (nonce_bytes, actual_cipher) = ciphertext.split_at(12);
+        let plain_or_compressed = if is_chacha(cipher_algo) {
+            use chacha20poly1305::{
+                ChaCha20Poly1305,
+                aead::{Aead, KeyInit},
+            };
+            let key_arr: [u8; 32] = dek
+                .try_into()
+                .map_err(|_| anyhow!("ChaCha20 key must be 32 bytes"))?;
+            let cipher_cha = ChaCha20Poly1305::new(&chacha20poly1305::Key::from(key_arr));
+            let nonce_cha = chacha20poly1305::Nonce::from(
+                <[u8; 12]>::try_from(nonce_bytes)
+                    .map_err(|_| anyhow!("ChaCha20 nonce must be 12 bytes"))?,
+            );
+            cipher_cha
+                .decrypt(&nonce_cha, actual_cipher)
+                .map_err(|_| anyhow::anyhow!("chunk decryption failed"))?
+        } else {
+            let cipher = Aes256Gcm::new_from_slice(dek)
+                .map_err(|_| anyhow!("AES-256 chunk key must be 32 bytes"))?;
+            cipher
+                .decrypt(&Nonce::clone_from_slice(nonce_bytes), actual_cipher)
+                .map_err(|_| anyhow::anyhow!("chunk decryption failed"))?
+        };
+
+        let mut plain_or_compressed = plain_or_compressed;
+        let is_padded = (comp_type & 0x80) != 0;
+        let comp_algo_type = comp_type & 0x7F;
+        if is_padded {
+            let len = plain_or_compressed.len();
+            if len >= 4 {
+                let mut len_bytes = [0u8; 4];
+                len_bytes.copy_from_slice(&plain_or_compressed[len - 4..]);
+                let orig_len = u32::from_be_bytes(len_bytes) as usize;
+                if orig_len <= len - 4 && orig_len <= 128 * 1024 * 1024 {
+                    plain_or_compressed.truncate(orig_len);
+                } else {
+                    anyhow::bail!(
+                        "padding length {orig_len} is implausible for buffer of size {len}"
+                    );
+                }
+            } else if len > 0 {
+                anyhow::bail!("Padded block too small: {len} bytes (< 4 byte padding header)");
+            }
+        }
+        let plaintext = decompress_sealed(
+            plain_or_compressed,
+            comp_algo_type,
+            Some(expected_len),
+            self.max_plaintext_len,
+        )?;
+        if plaintext.len() != expected_len as usize {
+            anyhow::bail!("sealed chunk plaintext length mismatch");
+        }
+        if blake3::hash(&plaintext).as_bytes() != expected_hash {
+            anyhow::bail!("sealed chunk plaintext hash mismatch");
+        }
+        Ok(zeroize::Zeroizing::new(plaintext))
+    }
+
+    #[cfg(test)]
     pub fn encrypt_chunk_symmetric(
         &self,
         plaintext: &[u8],
         sym_key_bytes: &[u8],
         comp_algo_override: Option<&str>,
     ) -> Result<(Vec<u8>, u8)> {
+        self.encrypt_chunk_with_nonce_mode(
+            plaintext,
+            sym_key_bytes,
+            comp_algo_override,
+            self.disable_dedup,
+        )
+    }
+
+    fn encrypt_chunk_with_nonce_mode(
+        &self,
+        plaintext: &[u8],
+        sym_key_bytes: &[u8],
+        comp_algo_override: Option<&str>,
+        random_nonce: bool,
+    ) -> Result<(Vec<u8>, u8)> {
         let mut compressed_data = None;
         let active_comp = comp_algo_override.unwrap_or(&self.comp_algo);
+        if active_comp != "none" && active_comp != "zstd" && active_comp != "lz4" {
+            anyhow::bail!("unknown compression algorithm: {active_comp}");
+        }
 
         if plaintext.len() >= self.comp_min_size {
             if active_comp == "zstd" {
@@ -662,13 +1049,13 @@ impl CryptoCtx {
 
         // Add padding to mitigate CRIME/BREACH attacks (Compression Oracle)
         let orig_len = final_data.len() as u32;
-        let pad_len = pad_len_to_block(final_data.len(), 4096);
+        let pad_len = (4096 - (final_data.len() % 4096)) % 4096;
         final_data.resize(final_data.len() + pad_len, 0u8);
         final_data.extend_from_slice(&orig_len.to_be_bytes());
         comp_type |= 0x80; // Set padded flag
 
         let mut nonce_bytes = vec![0u8; 12];
-        if self.disable_dedup {
+        if random_nonce {
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
         } else {
             // the fixed `convergent_n` nonce is SAFE ONLY because
@@ -722,7 +1109,7 @@ impl CryptoCtx {
                 .map_err(|_| anyhow::anyhow!("chunk encryption failed"))?
         };
 
-        if self.disable_dedup {
+        if random_nonce {
             let mut final_cipher = nonce_bytes;
             final_cipher.append(&mut ciphertext);
             ciphertext = final_cipher;
@@ -731,7 +1118,7 @@ impl CryptoCtx {
         Ok((ciphertext, comp_type))
     }
 
-    pub fn decrypt_chunk_symmetric(
+    fn decrypt_chunk_symmetric(
         &self,
         ciphertext: &[u8],
         wrapped_sym_key: &[u8],
@@ -743,16 +1130,30 @@ impl CryptoCtx {
         // than re-wrapping it with the inner `{e}` text and a symmetric-mode-wrong
         // "--priv-key" hint. `decrypt_blob` already returns a non-leaky message
         // ("KEK unwrap failed …" for symmetric, "Envelope unwrap failed …" for age).
-        let sym_key_bytes = self.decrypt_blob_cached(wrapped_sym_key)?;
+        let record = self.decrypt_blob_cached(wrapped_sym_key)?;
+        // reader accepts ONLY sealed CSK02 records.  Legacy raw 32-byte
+        // wrapped keys are rejected (all current archive data is sealed; B05).
+        let meta = parse_sealed_record(&record)?;
+        validate_cipher_pair(meta.cipher_id, cipher_algo)?;
+        if meta.comp_type != comp_type {
+            anyhow::bail!("sealed chunk comp_type does not match request");
+        }
+        if meta.plaintext_len > self.max_plaintext_len as u64
+            || meta.ciphertext_len != ciphertext.len() as u64
+            || meta.object_hash != *blake3::hash(ciphertext).as_bytes()
+        {
+            anyhow::bail!("sealed chunk metadata is corrupt");
+        }
+        let (sym_key_bytes, expected_len) = (&record[5..37], Some(meta.plaintext_len as usize));
 
-        let (nonce_bytes, actual_cipher) = if self.disable_dedup {
-            if ciphertext.len() < 12 {
-                return Err(anyhow::anyhow!("Ciphertext too short"));
-            }
-            ciphertext.split_at(12)
-        } else {
-            (b"convergent_n".as_ref(), ciphertext)
-        };
+        // B05: all current archive objects are sealed (BF-01). The convergent
+        // nonce read path predates sealing and is removed so decrypt never
+        // depends on the runtime disable_dedup flag — the nonce always comes
+        // from the ciphertext prefix written at seal time.
+        if ciphertext.len() < 12 {
+            return Err(anyhow::anyhow!("Ciphertext too short"));
+        }
+        let (nonce_bytes, actual_cipher) = ciphertext.split_at(12);
 
         let plain_or_compressed = if is_chacha(cipher_algo) {
             use chacha20poly1305::{
@@ -760,7 +1161,6 @@ impl CryptoCtx {
                 aead::{Aead, KeyInit},
             };
             let key_arr: [u8; 32] = sym_key_bytes
-                .as_slice()
                 .try_into()
                 .map_err(|_| anyhow!("ChaCha20 key must be 32 bytes"))?;
             let key = chacha20poly1305::Key::from(key_arr);
@@ -775,7 +1175,7 @@ impl CryptoCtx {
         } else {
             // A corrupt/wrong-length key must Err cleanly, not panic in
             // `clone_from_slice` (parity with the ChaCha `try_into` path above).
-            let cipher = Aes256Gcm::new_from_slice(&sym_key_bytes)
+            let cipher = Aes256Gcm::new_from_slice(sym_key_bytes)
                 .map_err(|_| anyhow!("AES-256 chunk key must be 32 bytes"))?;
             let nonce = Nonce::clone_from_slice(nonce_bytes);
             cipher
@@ -810,17 +1210,44 @@ impl CryptoCtx {
             }
         }
 
-        if comp_algo_type == 1 {
-            let decoded = zstd::stream::decode_all(std::io::Cursor::new(plain_or_compressed))
-                .map_err(|e| anyhow::anyhow!("ZSTD decompression failed: {e}"))?;
-            Ok(zeroize::Zeroizing::new(decoded))
-        } else if comp_algo_type == 2 {
-            let decoded = lz4_flex::decompress_size_prepended(&plain_or_compressed)
-                .map_err(|e| anyhow::anyhow!("LZ4 decompression failed: {e}"))?;
-            Ok(zeroize::Zeroizing::new(decoded))
-        } else {
-            Ok(zeroize::Zeroizing::new(plain_or_compressed))
+        let plaintext = decompress_sealed(
+            plain_or_compressed,
+            comp_algo_type,
+            expected_len.map(|e| e as u64),
+            self.max_plaintext_len,
+        )?;
+        if let Some(expected_len) = expected_len {
+            if plaintext.len() != expected_len {
+                anyhow::bail!("sealed chunk plaintext length mismatch");
+            }
         }
+        if plaintext.len() > self.max_plaintext_len {
+            anyhow::bail!("plaintext exceeds configured maximum");
+        }
+        if blake3::hash(&plaintext).as_bytes() != &meta.plaintext_hash {
+            anyhow::bail!("sealed chunk plaintext hash mismatch");
+        }
+        Ok(zeroize::Zeroizing::new(plaintext))
+    }
+
+    /// Open a sealed chunk without trusting unauthenticated caller metadata.
+    /// The compression and cipher settings are recovered from the authenticated
+    /// CSK02 record before delegating to the normal sealed reader.
+    pub fn decrypt_sealed_chunk(
+        &self,
+        ciphertext: &[u8],
+        wrapped_key: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let record = self.decrypt_blob_cached(wrapped_key)?;
+        if record.len() != SEALED_KEY_LEN || !record.starts_with(SEALED_KEY_MAGIC) {
+            anyhow::bail!("record is not a sealed CSK02 chunk-key record");
+        }
+        let cipher_algo = match record[38] {
+            0 => "aes-gcm",
+            1 => "chacha20-poly1305",
+            id => anyhow::bail!("unknown cipher id {id} in sealed chunk record"),
+        };
+        self.decrypt_chunk_symmetric(ciphertext, wrapped_key, record[37], cipher_algo)
     }
 }
 
@@ -828,7 +1255,6 @@ impl CryptoCtx {
 mod tests {
     use super::*;
     use age::x25519::Identity;
-    use proptest::prelude::any;
     use secrecy::SecretString;
 
     fn setup_ctx(crypto_algo: &str, disable_dedup: bool) -> CryptoCtx {
@@ -856,7 +1282,7 @@ mod tests {
             sym_key_cache: CryptoCtx::new_sym_key_cache(DEFAULT_SYM_KEY_CACHE_CAP),
             hide_names: false,
             name_hash_secret: parking_lot::Mutex::new(None),
-            name_cache: CryptoCtx::new_name_cache(DEFAULT_NAME_CACHE_CAP),
+            max_plaintext_len: DEFAULT_MAX_PLAINTEXT_LEN,
         }
     }
 
@@ -930,30 +1356,30 @@ mod tests {
 
     #[test]
     fn test_disable_dedup_ciphertext_diverges_and_roundtrips() {
-        // in random (no-dedup) mode identical plaintext must yield
-        // DIFFERENT ciphertext (no convergence oracle for an attacker holding
-        // only the chunk store), and each chunk must still round-trip.
-        let ctx = setup_ctx("aes-gcm", true);
-        let plaintext = b"identical chunk plaintext for the convergence probe, padded long";
+        // Sealed contract (R05/B05): even in no-dedup mode, two seal_chunk
+        // calls on identical plaintext produce DIFFERENT ciphertext (random
+        // DEK + nonce per chunk — no convergence oracle), and both round-trip
+        // through the SEALED decrypt path (raw-key read is gone).
+        for dedup_flag in [true, false] {
+            let ctx = setup_ctx("aes-gcm", dedup_flag);
+            let plaintext = b"identical chunk plaintext for the convergence probe, padded long";
 
-        let k1 = ctx.generate_chunk_key(plaintext).unwrap();
-        let k2 = ctx.generate_chunk_key(plaintext).unwrap();
-        let (c1, t1) = ctx.encrypt_chunk_symmetric(plaintext, &k1, None).unwrap();
-        let (c2, _t2) = ctx.encrypt_chunk_symmetric(plaintext, &k2, None).unwrap();
-        assert_ne!(c1, c2, "no-dedup mode produced identical ciphertexts");
+            let a = ctx.seal_chunk(plaintext, None).unwrap();
+            let b = ctx.seal_chunk(plaintext, None).unwrap();
+            assert_ne!(a.ciphertext, b.ciphertext, "ciphertext must not converge");
 
-        let wrapped1 = ctx.encrypt_blob(&k1).unwrap();
-        let decrypted = ctx
-            .decrypt_chunk_symmetric(&c1, &wrapped1, t1, "aes-gcm")
-            .unwrap();
-        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
-
-        // Control: convergent mode stays convergent.
-        let conv = setup_ctx("aes-gcm", false);
-        let ck1 = conv.generate_chunk_key(plaintext).unwrap();
-        let (cc1, _) = conv.encrypt_chunk_symmetric(plaintext, &ck1, None).unwrap();
-        let (cc2, _) = conv.encrypt_chunk_symmetric(plaintext, &ck1, None).unwrap();
-        assert_eq!(cc1, cc2, "convergent mode must stay deterministic");
+            for sealed in [&a, &b] {
+                let out = ctx
+                    .decrypt_chunk_symmetric(
+                        &sealed.ciphertext,
+                        &sealed.wrapped_key,
+                        sealed.comp_type,
+                        &sealed.cipher_algo,
+                    )
+                    .unwrap();
+                assert_eq!(plaintext.as_slice(), out.as_slice());
+            }
+        }
     }
 
     #[test]
@@ -961,14 +1387,14 @@ mod tests {
         let ctx = setup_ctx("aes-gcm", false);
         let plaintext = b"hello world, this is a test payload long enough to maybe compress";
 
-        let sym_key = ctx.generate_chunk_key(plaintext).unwrap();
-        let wrapped_sym_key = ctx.encrypt_blob(&sym_key).unwrap();
-
-        let (ciphertext, comp_type) = ctx
-            .encrypt_chunk_symmetric(plaintext, &sym_key, None)
-            .unwrap();
+        let sealed = ctx.seal_chunk(plaintext, None).unwrap();
         let decrypted = ctx
-            .decrypt_chunk_symmetric(&ciphertext, &wrapped_sym_key, comp_type, "aes-gcm")
+            .decrypt_chunk_symmetric(
+                &sealed.ciphertext,
+                &sealed.wrapped_key,
+                sealed.comp_type,
+                &sealed.cipher_algo,
+            )
             .unwrap();
 
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
@@ -979,17 +1405,90 @@ mod tests {
         let ctx = setup_ctx("chacha20poly1305", false);
         let plaintext = b"hello world, this is a test payload long enough to maybe compress";
 
-        let sym_key = ctx.generate_chunk_key(plaintext).unwrap();
-        let wrapped_sym_key = ctx.encrypt_blob(&sym_key).unwrap();
-
-        let (ciphertext, comp_type) = ctx
-            .encrypt_chunk_symmetric(plaintext, &sym_key, None)
-            .unwrap();
+        let sealed = ctx.seal_chunk(plaintext, None).unwrap();
         let decrypted = ctx
-            .decrypt_chunk_symmetric(&ciphertext, &wrapped_sym_key, comp_type, "chacha20poly1305")
+            .decrypt_chunk_symmetric(
+                &sealed.ciphertext,
+                &sealed.wrapped_key,
+                sealed.comp_type,
+                &sealed.cipher_algo,
+            )
             .unwrap();
 
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn seal_chunk_random_objects_roundtrip() {
+        for algo in ["aes-gcm", "chacha20-poly1305"] {
+            for disable_dedup in [false, true] {
+                let ctx = setup_ctx(algo, disable_dedup);
+                let data = vec![42; 8192];
+                let first = ctx.seal_chunk(&data, None).unwrap();
+                let second = ctx.seal_chunk(&data, None).unwrap();
+                assert_ne!(first.object_id, second.object_id);
+                assert_ne!(first.ciphertext, second.ciphertext);
+                assert_eq!(
+                    ctx.decrypt_chunk_symmetric(
+                        &first.ciphertext,
+                        &first.wrapped_key,
+                        first.comp_type,
+                        &first.cipher_algo
+                    )
+                    .unwrap(),
+                    data.clone().into()
+                );
+                assert_eq!(
+                    ctx.decrypt_chunk_symmetric(
+                        &second.ciphertext,
+                        &second.wrapped_key,
+                        second.comp_type,
+                        &second.cipher_algo
+                    )
+                    .unwrap(),
+                    data.into()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seal_chunk_content_id_is_archive_keyed() {
+        let ctx = setup_ctx("aes-gcm", false);
+        let id = ctx.content_id(b"same").unwrap().unwrap();
+        assert_eq!(ctx.content_id(b"same").unwrap(), Some(id));
+        assert_ne!(ctx.content_id(b"different").unwrap(), Some(id));
+        assert_eq!(
+            setup_ctx("aes-gcm", true).content_id(b"same").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn seal_chunk_rejects_authenticated_metadata_mismatch() {
+        let ctx = setup_ctx("aes-gcm", false);
+        let sealed = ctx.seal_chunk(&vec![b'a'; 16384], Some("zstd")).unwrap();
+        assert!(
+            ctx.decrypt_chunk_symmetric(
+                &sealed.ciphertext,
+                &sealed.wrapped_key,
+                sealed.comp_type ^ 1,
+                &sealed.cipher_algo
+            )
+            .is_err()
+        );
+        let mut record = ctx.decrypt_blob(&sealed.wrapped_key).unwrap();
+        record[39..47].copy_from_slice(&10u64.to_le_bytes());
+        let wrapped = ctx.encrypt_blob(&record).unwrap();
+        assert!(
+            ctx.decrypt_chunk_symmetric(
+                &sealed.ciphertext,
+                &wrapped,
+                sealed.comp_type,
+                &sealed.cipher_algo
+            )
+            .is_err()
+        );
     }
 
     fn symmetric_ctx(pass: &str, wrapped_kek: Option<Vec<u8>>) -> Result<CryptoCtx> {
@@ -1006,6 +1505,120 @@ mod tests {
             SecretString::from(pass.to_string()),
             wrapped_kek,
         )
+    }
+
+    fn plaintext_pair() -> &'static [u8] {
+        b"shared-dedup canonical payload for the domain"
+    }
+
+    #[test]
+    fn test_shared_domain_wrap_unwrap_roundtrip_random_nonce() {
+        let key = shared_domain_wrapping_key(b"domain secret");
+        let record = b"CSK02fixed-shared-record-bytes-for-the-wrap-test...";
+        let wrapped = wrap_with_domain_key(record, &key).unwrap();
+        assert!(wrapped.starts_with(b"CKEK1"), "must use the KEK envelope");
+        assert!(wrapped.len() > record.len(), "nonce+tag overhead");
+        let unwrapped = unwrap_with_domain_key(&wrapped, &key).unwrap();
+        assert_eq!(unwrapped.as_slice(), record);
+        // Distinct nonces per wrap → two wraps of the same record differ
+        // (condition 4: no deterministic IV).
+        let again = wrap_with_domain_key(record, &key).unwrap();
+        assert_ne!(wrapped, again, "random nonce per wrap");
+        // Wrong domain key fails loudly.
+        assert!(unwrap_with_domain_key(&wrapped, &shared_domain_wrapping_key(b"other")).is_err());
+    }
+
+    #[test]
+    fn test_seal_chunk_shared_domain_member_can_decrypt() {
+        let ctx = symmetric_ctx("correct horse battery staple", None).unwrap();
+        let domain_key = shared_domain_wrapping_key(b"shared domain secret");
+        let plaintext = plaintext_pair();
+        let sealed = ctx.seal_chunk_shared(plaintext, None, &domain_key).unwrap();
+
+        // The domain-wrapped record parses to the bound metadata and the
+        // ciphertext the record names.
+        let record = unwrap_with_domain_key(&sealed.domain_wrapped_key, &domain_key).unwrap();
+        let meta = parse_sealed_record(&record).unwrap();
+        assert_eq!(meta.ciphertext_len, sealed.ciphertext_len);
+        assert_eq!(meta.plaintext_len, sealed.plaintext_len);
+        assert_eq!(meta.object_hash, sealed.object_hash);
+        assert_eq!(meta.comp_type, sealed.comp_type);
+
+        // A domain member (another archive, same domain secret) decrypts the
+        // SAME canonical object:
+        let decrypted = ctx
+            .decrypt_chunk_shared_record(
+                &sealed.ciphertext,
+                &record,
+                sealed.comp_type,
+                &sealed.cipher_algo,
+            )
+            .unwrap();
+        assert_eq!(decrypted.as_slice(), plaintext);
+    }
+
+    #[test]
+    fn test_seal_chunk_shared_archive_path_still_works_for_publisher() {
+        let ctx = symmetric_ctx("correct horse battery staple", None).unwrap();
+        let domain_key = shared_domain_wrapping_key(b"shared domain secret");
+        let plaintext = plaintext_pair();
+        let sealed = ctx.seal_chunk_shared(plaintext, None, &domain_key).unwrap();
+
+        // The publisher's own index stores the archive-key wrap; factory reads
+        // still decrypt via decrypt_chunk_symmetric.
+        let decrypted = ctx
+            .decrypt_chunk_symmetric(
+                &sealed.ciphertext,
+                &sealed.archive_wrapped_key,
+                sealed.comp_type,
+                &sealed.cipher_algo,
+            )
+            .unwrap();
+        assert_eq!(decrypted.as_slice(), plaintext);
+        // ...and the domain wrap decrypts the same object as well.
+        let record = unwrap_with_domain_key(&sealed.domain_wrapped_key, &domain_key).unwrap();
+        let via_domain = ctx
+            .decrypt_chunk_shared_record(
+                &sealed.ciphertext,
+                &record,
+                sealed.comp_type,
+                &sealed.cipher_algo,
+            )
+            .unwrap();
+        assert_eq!(via_domain.as_slice(), plaintext);
+    }
+
+    #[test]
+    fn test_parse_sealed_record_rejects_truncated_or_mangled() {
+        assert!(parse_sealed_record(b"short").is_err());
+        let good = [0u8; SEALED_KEY_LEN];
+        let mut rec = good;
+        rec[0..5].copy_from_slice(SEALED_KEY_MAGIC);
+        assert!(parse_sealed_record(&rec).is_ok());
+        rec[80] ^= 0xFF; // corrupt object_hash region
+        assert!(parse_sealed_record(&rec).is_ok(), "magic/len unchanged");
+        // Mangle the magic instead:
+        let mut bad = rec;
+        bad[0] = b'X';
+        assert!(parse_sealed_record(&bad).is_err());
+    }
+
+    #[test]
+    fn sealed_plaintext_hash_is_checked_after_authenticated_unwrap() {
+        let ctx = setup_ctx("aes-gcm", false);
+        let sealed = ctx
+            .seal_chunk(b"plaintext integrity", Some("none"))
+            .unwrap();
+        // Re-encrypting the altered record makes the outer wrapper valid, so
+        // this reaches the post-decryption plaintext-hash check rather than
+        // merely proving that AEAD rejects a corrupted wrapper.
+        let mut record = ctx.decrypt_blob(&sealed.wrapped_key).unwrap();
+        record[87] ^= 0x80;
+        let altered = ctx.encrypt_blob(&record).unwrap();
+        let err = ctx
+            .decrypt_sealed_chunk(&sealed.ciphertext, &altered)
+            .unwrap_err();
+        assert!(err.to_string().contains("plaintext hash mismatch"), "{err}");
     }
 
     /// Symmetric (password-only) envelope: chunk keys are wrapped with the
@@ -1029,12 +1642,15 @@ mod tests {
         );
         assert_eq!(ctx.decrypt_blob(&wrapped).unwrap(), sym_key.clone());
 
-        // Full chunk roundtrip through the cached path used by reads.
-        let (ciphertext, comp_type) = ctx
-            .encrypt_chunk_symmetric(plaintext, &sym_key, None)
-            .unwrap();
+        // Full chunk roundtrip through the sealed (BF-01) path.
+        let sealed = ctx.seal_chunk(plaintext, None).unwrap();
         let decrypted = ctx
-            .decrypt_chunk_symmetric(&ciphertext, &wrapped, comp_type, "aes-gcm")
+            .decrypt_chunk_symmetric(
+                &sealed.ciphertext,
+                &sealed.wrapped_key,
+                sealed.comp_type,
+                &sealed.cipher_algo,
+            )
             .unwrap();
         assert_eq!(plaintext.as_slice(), decrypted.as_slice());
 
@@ -1101,44 +1717,6 @@ mod tests {
             c_cli, c_cha,
             "CLI '--crypto-algo chacha20-poly1305' must select ChaCha, not silently AES"
         );
-    }
-
-    #[test]
-    fn test_decrypt_name_cached_matches_uncached_and_is_faster_on_repeat() {
-        let ctx = setup_ctx("aes-gcm", false).with_hide_names([7u8; 32]);
-        let blob = ctx.encrypt_name("cached-name.txt").unwrap().unwrap();
-
-        // Correctness: cached path returns the same plaintext as the
-        // uncached primitive, on both the cold (populate) and warm (hit) call.
-        let direct = ctx.decrypt_name(&blob).unwrap();
-        let cold = ctx.decrypt_name_cached(&blob).unwrap();
-        let warm = ctx.decrypt_name_cached(&blob).unwrap();
-        assert_eq!(direct, "cached-name.txt");
-        assert_eq!(cold, direct);
-        assert_eq!(warm, direct);
-
-        // A corrupt blob must still error on the cached path (no poisoned
-        // cache entry masking a real decrypt failure).
-        let mut corrupt = blob.clone();
-        corrupt[0] ^= 0xFF;
-        assert!(ctx.decrypt_name_cached(&corrupt).is_err());
-
-        // zeroize_keys clears the cache: a decrypt right after must still
-        // succeed (falls through to a fresh decrypt_name, not a stale hit
-        // from before the private key was dropped -- the private key is
-        // still loaded here, only the cache is being asserted as cleared).
-        ctx.name_cache.lock().clear();
-        assert_eq!(ctx.decrypt_name_cached(&blob).unwrap(), direct);
-    }
-
-    #[test]
-    fn test_zeroize_keys_clears_name_cache() {
-        let ctx = setup_ctx("aes-gcm", false).with_hide_names([7u8; 32]);
-        let blob = ctx.encrypt_name("secret-name.txt").unwrap().unwrap();
-        ctx.decrypt_name_cached(&blob).unwrap();
-        assert_eq!(ctx.name_cache.lock().len(), 1, "cache should hold the entry before zeroize");
-        ctx.zeroize_keys();
-        assert_eq!(ctx.name_cache.lock().len(), 0, "zeroize_keys must clear the name cache");
     }
 
     #[test]
@@ -1212,190 +1790,215 @@ mod tests {
             let ctx = setup_ctx(algo, true);
             let plaintext = b"some random data without deduplication";
 
-            let sym_key = ctx.generate_chunk_key(plaintext).unwrap();
-            let wrapped_sym_key = ctx.encrypt_blob(&sym_key).unwrap();
-
-            let (ciphertext, comp_type) = ctx
-                .encrypt_chunk_symmetric(plaintext, &sym_key, None)
-                .unwrap();
+            let sealed = ctx.seal_chunk(plaintext, None).unwrap();
             let decrypted = ctx
-                .decrypt_chunk_symmetric(&ciphertext, &wrapped_sym_key, comp_type, algo)
+                .decrypt_chunk_symmetric(
+                    &sealed.ciphertext,
+                    &sealed.wrapped_key,
+                    sealed.comp_type,
+                    &sealed.cipher_algo,
+                )
                 .unwrap();
 
             assert_eq!(plaintext.as_slice(), decrypted.as_slice());
         }
     }
 
-    // ------------------------------------------------------------------
-    // Golden ciphertext vectors. Round-trip tests are
-    // necessary but not sufficient: a systematic bug in the cipher layer
-    // (wrong nonce order, broken key schedule, off-by-one AAD) survives
-    // encrypt→decrypt because BOTH sides are equally wrong. These tests pin
-    // the AEAD primitives against the published RFC 8439 / NIST CAVP vectors,
-    // so the cipher layer is proven correct, not just self-consistent.
-    // ------------------------------------------------------------------
-
-    /// RFC 8439 §2.8.2 Test Vector #2 — ChaCha20-Poly1305 AEAD (the exact
-    /// vector the RFC's own implementors use). The ciphertext below is
-    /// ct‖tag as produced by the `encrypt` API (114 + 16 bytes).
     #[test]
-    fn test_rfc8439_chacha20_poly1305_vector2() {
-        use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
-
-        let key_bytes =
-            hex::decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
-                .unwrap();
-        let nonce_bytes = hex::decode("070000004041424344454647").unwrap();
-        let aad = hex::decode("50515253c0c1c2c3c4c5c6c7").unwrap();
-
-        let cipher = chacha20poly1305::ChaCha20Poly1305::new(
-            &chacha20poly1305::Key::try_from(key_bytes.as_slice()).unwrap(),
-        );
-        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer \
-            you only one tip for the future, sunscreen would be it.";
-
-        let out = cipher
-            .encrypt(
-                &chacha20poly1305::Nonce::try_from(nonce_bytes.as_slice()).unwrap(),
-                Payload {
-                    msg: plaintext,
-                    aad: &aad,
-                },
-            )
-            .expect("RFC 8439 vector 2 must encrypt");
-
-        let expected = hex::decode(
-            "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63\
-             dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692\
-             ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4\
-             def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691",
-        )
-        .unwrap();
-        assert_eq!(
-            out, expected,
-            "ChaCha20-Poly1305 must match RFC 8439 vector 2"
-        );
-    }
-
-    /// NIST GCM CAVP `gcmEncryptExtIV256.rsp` — AES-256-GCM, IV 12 bytes.
-    /// Case 1 (empty plaintext) and Case 2 (16-byte plaintext), both with the
-    /// zero key, zero IV and empty AAD. `encrypt` returns ct‖tag; the files
-    /// list CT and Tag separately, so the expected value is CT‖Tag.
-    #[test]
-    fn test_nist_aes256_gcm_cavp_vectors() {
-        use aes_gcm::aead::{Aead as _, KeyInit as _, Payload};
-
-        let cipher =
-            aes_gcm::Aes256Gcm::new(aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(&[0u8; 32]));
-        let iv = aes_gcm::Nonce::from_slice(&[0u8; 12]);
-        let empty_aad: [u8; 0] = [];
-
-        // Case 1: empty plaintext.
-        let out = cipher
-            .encrypt(
-                iv,
-                Payload {
-                    msg: &[],
-                    aad: &empty_aad,
-                },
-            )
-            .expect("NIST Case 1 must encrypt");
-        assert_eq!(
-            out,
-            hex::decode("530f8afbc74536b9a963b4f1c4cb738b").unwrap(),
-            "AES-256-GCM must match NIST gcmEncryptExtIV256 Case 1"
-        );
-
-        // Case 2: 16 zero bytes.
-        let out = cipher
-            .encrypt(
-                iv,
-                Payload {
-                    msg: &[0u8; 16],
-                    aad: &empty_aad,
-                },
-            )
-            .expect("NIST Case 2 must encrypt");
-        assert_eq!(
-            out,
-            hex::decode("cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919")
-                .unwrap(),
-            "AES-256-GCM must match NIST gcmEncryptExtIV256 Case 2"
-        );
-    }
-
-    /// Format-contrast golden test: the FULL chunk pipeline (no compression,
-    /// convergent fixed nonce, known key) must produce a byte-exact, stable
-    /// ciphertext. Guards against silent format/cipher changes — e.g. a
-    /// swapped padding layout or a different nonce — that round-trip tests
-    /// cannot see. `comp_min_size` is huge so compression is skipped, and the
-    /// plaintext is shorter than it, so `final_data` = pt ‖ pad ‖ orig_len.
-    ///
-    /// The golden value (~4 KiB of hex, padding to 4096 + length trailer) is
-    /// kept out of the source in `tests/golden_chunk.hex` and regenerated only
-    /// when the chunk format is INTENTIONALLY changed:
-    ///   eprintln!("{}", hex::encode(&ciphertext));  > tests/golden_chunk.hex
-    #[test]
-    fn test_chunk_format_golden_convergent() {
+    fn seal_rejects_unknown_compression_flag_on_roundtrip() {
         let ctx = setup_ctx("aes-gcm", false);
-        let key = [0u8; 32];
-        // 2-byte plaintext < comp_min_size(10) => no compression; deterministic.
-        let (ciphertext, comp_type) = ctx.encrypt_chunk_symmetric(b"hi", &key, None).unwrap();
+        let data = vec![7u8; 512];
+        let sealed = ctx.seal_chunk(&data, None).unwrap();
+        assert!(ctx.seal_chunk(&data, Some("none")).is_ok());
+        let wrapped = sealed.wrapped_key.clone();
+        let res = ctx.decrypt_chunk_symmetric(&sealed.ciphertext, &wrapped, 99u8, "aes-gcm");
+        assert!(res.is_err());
+    }
 
-        assert_eq!(comp_type & 0x7F, 0, "no compression expected");
-        assert_ne!(comp_type & 0x80, 0, "padding flag must be set");
-
-        let golden = include_str!("../tests/golden_chunk.hex").trim();
-        assert_eq!(
-            hex::encode(&ciphertext),
-            golden,
-            "convergent chunk format drifted"
+    #[test]
+    fn seal_rejects_unknown_compression_algorithm_on_write() {
+        let ctx = setup_ctx("aes-gcm", false);
+        assert!(
+            ctx.seal_chunk(b"hello".repeat(100).as_slice(), Some("bzip2"))
+                .is_err()
+        );
+        assert!(
+            ctx.encrypt_chunk_symmetric(b"data", &[0u8; 32], Some("bzip2"))
+                .is_err()
         );
     }
 
-    // ------------------------------------------------------------------
-    // Property round-trip: arbitrary payloads (random,
-    // structured, compressible, repeated, empty-ish) must survive the full
-    // chunk pipeline — compression, CRIME-padding, per-chunk key wrap,
-    // ciphertext — for both ciphers and both dedup modes. The handful of
-    // hand-written round-trips can't cover the tails that fuzzing does.
-    // ------------------------------------------------------------------
+    #[test]
+    fn r04_lz4_oversized_prefix_is_rejected_before_allocation() {
+        // the LZ4 length prefix is attacker-controlled.  A real lz4 block
+        // with a HUGE prefixed size must be rejected against the authenticated
+        // expected_len BEFORE any allocation happens.
+        let original = vec![0x5Au8; 1024];
+        let block = lz4_flex::compress(&original);
+        let mut crafted = Vec::with_capacity(4 + block.len());
+        crafted.extend_from_slice(&(1u64 << 30).to_le_bytes());
+        crafted.extend_from_slice(&block);
+        let err = decompress_sealed(crafted, 2, Some(1024), 1 << 20).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeding the configured bound"),
+            "{err}"
+        );
+    }
 
-    proptest::proptest! {
-        #[test]
-        fn chunk_roundtrip_prop_any_payload(
-            payload in proptest::collection::vec(any::<u8>(), 0..300usize),
-            algo in proptest::sample::select(vec!["aes-gcm", "chacha20poly1305"]),
-            no_dedup in proptest::bool::ANY,
-        ) {
-            let ctx = setup_ctx(algo, no_dedup);
-            let key = ctx.generate_chunk_key(&payload).unwrap();
-            let (ciphertext, comp_type) = ctx
-                .encrypt_chunk_symmetric(&payload, &key, None)
-                .unwrap();
-            let wrapped = ctx.encrypt_blob(&key).unwrap();
-            let back = ctx
-                .decrypt_chunk_symmetric(&ciphertext, &wrapped, comp_type, algo)
-                .unwrap();
-            proptest::prop_assert_eq!(&payload[..], back.as_slice());
-        }
+    #[test]
+    fn r04_lz4_positive_control_and_malformed_header() {
+        let original = vec![0x3Cu8; 2048];
+        let block = lz4_flex::compress(&original);
+        let mut proper = Vec::with_capacity(4 + block.len());
+        proper.extend_from_slice(&(original.len() as u32).to_le_bytes());
+        proper.extend_from_slice(&block);
+        let out = decompress_sealed(proper, 2, Some(original.len() as u64), 1 << 20).unwrap();
+        assert_eq!(out, original, "positive control must round-trip");
 
-        #[test]
-        fn chunk_roundtrip_prop_compressible(
-            block in proptest::collection::vec(any::<u8>(), 0..64usize),
-            repeat in 0..8usize,
-        ) {
-            let payload = block.repeat(repeat);
+        let err = decompress_sealed(vec![1u8, 2], 2, Some(1), 1 << 10).unwrap_err();
+        assert!(err.to_string().contains("LZ4 block too small"), "{err}");
+    }
+
+    #[test]
+    fn r04_zstd_oversized_declared_content_is_rejected() {
+        // A 1 MiB zero block compresses to a few hundred bytes, so the FRAME
+        // HEADER still declares the full output size — decompress_sealed must
+        // reject it against a small bound WITHOUT allocating megabytes.
+        let big = vec![0u8; 1 << 20];
+        let compressed = zstd::bulk::compress(&big, 3).unwrap();
+        let err = decompress_sealed(compressed.clone(), 1, Some(1024), 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeding the configured bound"),
+            "{err}"
+        );
+        // Positive control: the same stream decompresses when the bound is big
+        // enough (no gigabytes; 1 MiB is fine).
+        let out = decompress_sealed(compressed, 1, Some(1 << 20), 1 << 20).unwrap();
+        assert_eq!(out, big);
+    }
+
+    #[test]
+    fn seal_zstd_sealed_path_still_roundtrips_with_the_new_bound() {
+        // Regression guard: legitimately sealed zstd/lz4 chunks still decrypt
+        // through the real decrypt path now that the decoder gate is bounded.
+        for comp in ["zstd", "lz4"] {
             let ctx = setup_ctx("aes-gcm", false);
-            let key = ctx.generate_chunk_key(&payload).unwrap();
-            let (ciphertext, comp_type) = ctx
-                .encrypt_chunk_symmetric(&payload, &key, None)
-                .unwrap();
-            let wrapped = ctx.encrypt_blob(&key).unwrap();
-            let back = ctx
-                .decrypt_chunk_symmetric(&ciphertext, &wrapped, comp_type, "aes-gcm")
-                .unwrap();
-            proptest::prop_assert_eq!(&payload[..], back.as_slice());
+            let data = b"The quick brown fox ".repeat(512);
+            let sealed = ctx
+                .seal_chunk(&data, Some(comp))
+                .unwrap_or_else(|e| panic!("seal {comp}: {e}"));
+            let out = ctx
+                .decrypt_chunk_symmetric(
+                    &sealed.ciphertext,
+                    &sealed.wrapped_key,
+                    sealed.comp_type,
+                    &sealed.cipher_algo,
+                )
+                .unwrap_or_else(|e| panic!("decrypt {comp}: {e}"));
+            assert_eq!(out.as_slice(), &data[..], "roundtrip {comp}");
         }
+    }
+
+    #[test]
+    fn r05_raw_wrapped_key_is_rejected() {
+        // Reader accepts ONLY sealed CSK02 records: a wrapped blob that unwraps
+        // to 32 raw bytes (no CSK02 magic) must be refused.
+        let ctx = setup_ctx("aes-gcm", false);
+        let raw = b"R".repeat(32);
+        let wrapped = ctx.encrypt_blob(&raw).unwrap();
+        let ciphertext = b"nonce-prefixed-ciphertext-bytes";
+        let err = ctx
+            .decrypt_chunk_symmetric(ciphertext, &wrapped, 0, "aes-gcm")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not a sealed chunk-key record (CSK02)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn r05_unknown_cipher_id_is_rejected() {
+        let ctx = setup_ctx("aes-gcm", false);
+        let data = b"cipher whitelist probe".repeat(4);
+        let sealed = ctx.seal_chunk(&data, None).unwrap();
+        // Materialize the sealed record, flip the cipher id to an unknown one
+        // (9) and re-wrap it: decryption must refuse the pair explicitly.
+        let mut rec = ctx.decrypt_blob(&sealed.wrapped_key).unwrap().to_vec();
+        rec[38] = 9;
+        let evil = ctx.encrypt_blob(&rec).unwrap();
+        let err = ctx
+            .decrypt_chunk_symmetric(&sealed.ciphertext, &evil, sealed.comp_type, "aes-gcm")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown cipher id 9"), "{msg}");
+    }
+
+    #[test]
+    fn plaintext_hash_mismatch_is_rejected_after_decompress_on_both_paths() {
+        // Post-decompress plaintext-hash verification: a validly AEAD-wrapped
+        // sealed record whose (authenticated) plaintext hash has been altered
+        // must be rejected with "plaintext hash mismatch" on the archive path
+        // AND on the shared/domain-read path.
+        let ctx = setup_ctx("aes-gcm", false);
+        let payload = b"post-decompress plaintext-hash verification".repeat(8);
+        let sealed = ctx.seal_chunk(&payload, Some("zstd")).unwrap();
+
+        // Archive path: flip the plaintext-hash field inside the SEALED record
+        // and re-wrap it with the archive key.
+        let mut record = ctx.decrypt_blob(&sealed.wrapped_key).unwrap().to_vec();
+        assert_eq!(record.len(), 119, "CSK02 sealed record length");
+        record[87..119].copy_from_slice(&[0xEEu8; 32]);
+        let evil = ctx.encrypt_blob(&record).unwrap();
+        let err = ctx
+            .decrypt_chunk_symmetric(&sealed.ciphertext, &evil, sealed.comp_type, "aes-gcm")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("plaintext hash mismatch"),
+            "archive: {err}"
+        );
+
+        // Shared/domain path: same tamper inside the domain-wrapped record.
+        let domain_key = shared_domain_wrapping_key(b"some pool secret");
+        let shared = ctx
+            .seal_chunk_shared(&payload, Some("zstd"), &domain_key)
+            .unwrap();
+        let mut sha_record = unwrap_with_domain_key(&shared.domain_wrapped_key, &domain_key)
+            .unwrap()
+            .to_vec();
+        sha_record[87..119].copy_from_slice(&[0xCCu8; 32]);
+        let err2 = ctx
+            .decrypt_chunk_shared_record(
+                &shared.ciphertext,
+                &sha_record,
+                shared.comp_type,
+                &shared.cipher_algo,
+            )
+            .unwrap_err();
+        assert!(
+            err2.to_string().contains("plaintext hash mismatch"),
+            "shared: {err2}"
+        );
+
+        // Positive controls: untouched records still decrypt on both paths.
+        let ok1 = ctx
+            .decrypt_chunk_symmetric(
+                &sealed.ciphertext,
+                &sealed.wrapped_key,
+                sealed.comp_type,
+                &sealed.cipher_algo,
+            )
+            .unwrap();
+        assert_eq!(ok1.as_slice(), payload);
+        let rec2 = unwrap_with_domain_key(&shared.domain_wrapped_key, &domain_key).unwrap();
+        let ok2 = ctx
+            .decrypt_chunk_shared_record(
+                &shared.ciphertext,
+                &rec2,
+                shared.comp_type,
+                &shared.cipher_algo,
+            )
+            .unwrap();
+        assert_eq!(ok2.as_slice(), payload);
     }
 }

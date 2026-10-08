@@ -809,7 +809,7 @@ NEW_HASH=$(md5sum "$W/nomod_src/f.txt" | cut -d' ' -f1)
 [ "$ORIG_HASH" = "$NEW_HASH" ] && ok "backup does not modify source files" || fail "backup modified source file"
 
 ###############################################################################
-# 25. Hostile: password/key gating
+# 25. Hostile audit: password/key gating (from HOSTILE_AUDIT.md P0-3/P1-8)
 ###############################################################################
 echo "=== 25. Hostile: password/key gating ==="
 
@@ -1332,7 +1332,7 @@ paranoid_setup_asym() {
 }
 
 # 35a: overwrite larger file with smaller — extracted size must be exact (no stale tail)
-# (durability claims in ARCHITECTURE/README)
+# (AUDIT V-37, durability claims in ARCHITECTURE/README)
 echo "=== 35a: overwrite larger→smaller must produce exact size (no tail) ==="
 db="$W/p35a.db"; db_clean "$db"
 "$BIN" "$db" init >/dev/null 2>&1
@@ -1533,8 +1533,8 @@ wait $P2; R2=$?
 T "$BIN" "$db" check >/dev/null 2>&1 && ok "37a2: archive intact after two concurrent backups" || fail "37a2: concurrent backups corrupted the archive"
 T "$BIN" "$db" verify >/dev/null 2>&1 && ok "37a3: all files restorable after concurrent backups" || fail "37a3: concurrent backups left an unrestorable file"
 
-# 37a4: 4-way concurrent FIRST backups on a fresh archive. Before this was
-# fixed the KEK was created lazily by the first backup, so racing first-backups
+# 37a4 (gate): 4-way concurrent FIRST backups on a fresh archive. Before the
+# F-1 fix the KEK was created lazily by the first backup, so racing first-backups
 # each generated their own KEK, last-writer-wins on the config row, and the
 # losers' chunk keys were silently orphaned (all processes exit 0, verify says
 # "KEK unwrap failed"). Now init establishes the KEK and the lazy path converges.
@@ -1550,7 +1550,7 @@ for d in 1 2 3 4; do
   KEK_PIDS="$KEK_PIDS $!"
 done
 for p in $KEK_PIDS; do wait "$p" || true; done
-T "$BIN" "$db" verify >/dev/null 2>&1 && ok "37a4: 4-way concurrent first backups share one KEK, all restorable" || fail "37a4: concurrent first backups orphaned chunk keys (KEK race)"
+T "$BIN" "$db" verify >/dev/null 2>&1 && ok "37a4: 4-way concurrent first backups share one KEK, all restorable" || fail "37a4: concurrent first backups orphaned chunk keys (F-1 KEK race)"
 
 # 37b: backup + gc concurrently (gc should not eat live data)
 db="$W/c37b.db"; db_clean "$db"
