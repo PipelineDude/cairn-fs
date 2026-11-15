@@ -1,0 +1,19 @@
+ALL: 77.10% (11735/15220 lines, excl. test files)
+measured: 2026-11-12T22:36:14Z
+# LIB-ONLY 85.98% (10227/11895 lines, excl. test files, CLI binaries, and vfs.rs)
+# per-file:
+#  crates/cairn-cdc/src/lib.rs|515/549
+#  crates/cairn-cdc/src/shared.rs|378/394
+#  crates/cairn-core/src/hashing.rs|369/382
+#  crates/cairn-core/src/lib.rs|3297/4308
+#  crates/cairn-core/src/shared_reader.rs|149/169
+#  crates/cairn-core/src/types.rs|11/11
+#  crates/cairn-core/src/vfs.rs|136/284
+#  crates/cairn-fuse/src/lib.rs|446/494
+#  crates/cairn-index/src/lib.rs|2471/2744
+#  crates/cairn-keys/src/main.rs|22/165
+#  crates/cairn-seal/src/lib.rs|1281/1390
+#  crates/cairn-store/src/lib.rs|660/769
+#  crates/cairn-store/src/shared_dedup.rs|487/517
+#  src/main.rs|1350/2876
+#  src/shared_dedup.rs|163/168
