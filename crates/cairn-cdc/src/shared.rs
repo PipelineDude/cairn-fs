@@ -20,7 +20,14 @@
 pub struct SharedDedupConfig {
     pub records_dir: String,
     pub domain_id: String,
-    pub domain_secret: Vec<u8>,
+    /// SH-5: the domain key material is zeroized on every drop (the chunker
+    /// clones this config per task — `Zeroizing`'s Clone bound guarantees every
+    /// copy is scrubbed, which a plain `Vec<u8>` would not be).
+    pub domain_secret: zeroize::Zeroizing<Vec<u8>>,
+    /// Random per-archive id (persisted in the archive config) naming the
+    /// holder links this archive registers for every domain chunk it indexes
+    /// (domain GC refcount, ROADMAP 2026-11-18).
+    pub holder_id: String,
 }
 
 /// Outcome of publishing one chunk into the domain.
@@ -61,14 +68,31 @@ pub async fn publish_shared_chunk(
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
+    // Domain GC: PIN FIRST — register the holder link before any record or
+    // object is read. A reclaim pass can then never delete the record+object
+    // while this archive is mid-flight on the content: gc aborts on any link
+    // it sees, and there is no window where we hold verified bytes while the
+    // content still looks unheld to gc (the old pin-after-verify order lost
+    // exactly there). If the chunk never ends up published, the pin is a
+    // harmless leak — stale-holder reclaim covers it.
+    cairn_store::shared_dedup::add_shared_holder(
+        &cfg.records_dir,
+        &namespace,
+        &content_id,
+        &cfg.holder_id,
+    )?;
+
     // BF-04.10: look the content up BEFORE sealing. Sealing first and adopting
     // after the race (the old order) persisted a fresh loser object — and a
     // cache entry for it — on every repeat write of identical content, with no
     // GC for any of them. The winner's record is fully verified here (key
     // unwrap, sealed-record parse, plaintext equality) before it is adopted.
-    if let Some(existing) =
-        cairn_store::shared_dedup::read_shared_record(&cfg.records_dir, &namespace, &content_id)?
-    {
+    if let Some(existing) = cairn_store::shared_dedup::read_shared_record(
+        &cfg.records_dir,
+        &namespace,
+        &content_id,
+        &cfg.domain_secret,
+    )? {
         let canonical = cairn_store::shared_dedup::read_shared_object(
             &cfg.records_dir,
             &namespace,
@@ -87,6 +111,13 @@ pub async fn publish_shared_chunk(
         )?;
         if existing_plaintext.as_slice() == plaintext {
             cacache::write(cache_dir, &existing.object_id, canonical).await?;
+            // Domain GC: a dedup hit is a USE — (re)register our holder link.
+            cairn_store::shared_dedup::add_shared_holder(
+                &cfg.records_dir,
+                &namespace,
+                &content_id,
+                &cfg.holder_id,
+            )?;
             let meta = &existing.sealed_meta;
             return Ok(SharedChunkOutcome {
                 object_id: existing.object_id.clone(),
@@ -141,11 +172,30 @@ pub async fn publish_shared_chunk(
                 cairn_store::shared_dedup::read_shared_object(&records_dir, &namespace, &object_id)
             }
         },
+        &cfg.domain_secret,
     )
     .await?
     {
         cairn_store::shared_dedup::SharedPublish::Published(rec) => rec,
-        cairn_store::shared_dedup::SharedPublish::Adopted(rec) => rec,
+        cairn_store::shared_dedup::SharedPublish::Adopted(rec) => {
+            // SH-8: we lost the race — our freshly sealed object is bound by
+            // NO record (the winner's record names the winner's object), so
+            // it would leak in the domain store forever. Best-effort delete
+            // it now; skip when our object_id equals the winner's (identical
+            // bytes → the object is shared and IS referenced).
+            if rec.object_id != my_object_id {
+                if let Err(e) = cairn_store::shared_dedup::remove_shared_object(
+                    &cfg.records_dir,
+                    &record.domain_ns,
+                    &my_object_id,
+                ) {
+                    tracing::warn!(
+                        "shared-dedup: loser object cleanup failed for {my_object_id}: {e}"
+                    );
+                }
+            }
+            rec
+        }
     };
 
     let canonical = cairn_store::shared_dedup::read_shared_object(
@@ -170,6 +220,15 @@ pub async fn publish_shared_chunk(
         anyhow::bail!("shared dedup winner plaintext does not match requested chunk");
     }
     cacache::write(cache_dir, &published.object_id, canonical).await?;
+    // Domain GC: register our holder link for the canonical (winner's) object
+    // we are about to index — hard error: an archive must never index domain
+    // content that GC could later consider unheld.
+    cairn_store::shared_dedup::add_shared_holder(
+        &cfg.records_dir,
+        &published.domain_ns,
+        &published.content_id,
+        &cfg.holder_id,
+    )?;
 
     let meta = &published.sealed_meta;
     Ok(SharedChunkOutcome {
@@ -209,7 +268,8 @@ mod tests {
         SharedDedupConfig {
             records_dir: records.to_string(),
             domain_id: domain.to_string(),
-            domain_secret: format!("domain-secret-{domain}").into_bytes(),
+            domain_secret: zeroize::Zeroizing::new(format!("domain-secret-{domain}").into_bytes()),
+            holder_id: format!("holder-{domain}"),
         }
     }
 
@@ -412,6 +472,41 @@ mod tests {
         assert_ne!(a.object_id, b.object_id);
     }
 
+    /// SH-8 regression: when two publishers race for the same content, the
+    /// loser's freshly sealed object must NOT linger in the domain store —
+    /// exactly one object file may remain afterwards. (The large payload makes
+    /// the seal outlast the lookup, so both publishers realistically take the
+    /// publish path; whichever loses must clean up.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn publisher_race_leaves_exactly_one_domain_object() {
+        let base = tempfile::tempdir().unwrap();
+        let records = base.path().join("records");
+        let cache = base.path().join("cache");
+        let crypto = cdc_ctx();
+        let cfg = cfg(records.to_str().unwrap(), "team-race");
+        let plaintext = vec![0xA7u8; 600_000]; // seal cost >> lookup cost
+
+        let (x, y) = tokio::join!(
+            publish_shared_chunk(&plaintext, &crypto, None, &cfg, cache.to_str().unwrap(),),
+            publish_shared_chunk(&plaintext, &crypto, None, &cfg, cache.to_str().unwrap(),),
+        );
+        let x = x.unwrap();
+        let y = y.unwrap();
+        assert_eq!(x.object_id, y.object_id, "both must land on one object");
+
+        let ns = cairn_store::shared_dedup::derive_namespace("team-race", &cfg.domain_secret);
+        let objects_dir = records.join("dedup/shared").join(&ns).join("objects");
+        let leftovers: Vec<_> = std::fs::read_dir(&objects_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![x.object_id.clone()],
+            "SH-8: loser-race objects leaked into the domain store"
+        );
+    }
+
     impl SharedChunkOutcome {
         fn sealed_meta_is_ok(&self) -> bool {
             !self.record.sealed_meta.wrapped_key.is_empty()
@@ -437,7 +532,8 @@ mod tests {
         let cfg = crate::shared::SharedDedupConfig {
             records_dir: records.to_string_lossy().to_string(),
             domain_id: "team-a".to_string(),
-            domain_secret: b"domain secret".to_vec(),
+            domain_secret: zeroize::Zeroizing::new(b"domain secret".to_vec()),
+            holder_id: "holder-integration".to_string(),
         };
         let payload = b"chunk payload that must cross-archive dedup".repeat(20);
 
@@ -484,5 +580,31 @@ mod tests {
                 c.hash_key
             );
         }
+
+        // Domain GC: publish AND dedup-hit both register our holder link.
+        let ns = cairn_store::shared_dedup::derive_namespace("team-a", b"domain secret");
+        assert!(cairn_store::shared_dedup::holders_enabled(
+            records.to_str().unwrap(),
+            &ns
+        ));
+        let holders_root = records.join("dedup/shared").join(&ns).join("holders");
+        let mut stack = vec![holders_root];
+        let mut links = 0;
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if e.file_name() == "holder-integration" {
+                        links += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            links >= 1,
+            "holder link missing after publish+adopt: {links}"
+        );
     }
 }

@@ -40,5 +40,10 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 # Copy the statically compiled binary
 COPY --from=builder /usr/src/cairn/target/release/cairn /cairn
 
+# Deliberate exception to "run as non-root" (semgrep missing-user-entrypoint):
+# FUSE mounts need CAP_SYS_ADMIN and /dev/fuse, and the scratch image has no
+# setuid fusermount3 helper, so a non-root USER would only break mounts —
+# container-side FUSE requires --privileged anyway. For backup/restore-only
+# usage, pass `--user` at run time instead.
 # Set the entrypoint
 ENTRYPOINT ["/cairn"]

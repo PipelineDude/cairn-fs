@@ -292,9 +292,12 @@ fn doc_append_only_gc_refused_without_grace() -> Result<()> {
     // The merged schema requires plaintext_hash + sym_key (both NOT NULL) and
     // stores created_at as an epoch integer.
     let conn = db.pool.get()?;
+    // A few seconds "in the future" instead of exactly '%s now': with 1-second
+    // epoch granularity, a chunk created in the same second as the query made
+    // this assertion flaky at second boundaries (observed 2/5 flakes).
     conn.execute(
         "INSERT INTO chunk_index (object_id, plaintext_hash, sym_key, created_at)
-         VALUES (?1, ?2, ?3, strftime('%s','now'))",
+         VALUES (?1, ?2, ?3, strftime('%s','now') + 5)",
         ("fresh_chunk", "ph-fresh", vec![0u8; 1]),
     )?;
 

@@ -88,8 +88,45 @@ cairn backup.db verify --force-remote --pub-key pub.pem --priv-key priv.pem
 Optional ops completeness: `verify --expect-min-files N` (compare to printed
 `Indexed regular files after backup` from the backup run).
 
+**One cache dir per archive.** `--cache-dir` is scoped to a single archive: both
+the `gc` local sweep and the `--cache-limit-mb` sweeper only know *that* archive's
+index (plus its `upload_queue`), so sharing one cache dir across archives lets one
+archive's GC delete another archive's in-use blobs. Keep them separate. Likewise
+`--shared-dedup-store-dir` must never equal the archive cache dir (refused at
+`init`): the sweeps would delete domain-store objects as orphans. Cache dirs are
+ownership-marked (`.cairn-cache-owner`): initializing a *differently named* archive
+into an existing archive's cache dir is refused; `--allow-shared-cache` overrides
+that on purpose (you then own the cross-GC risk).
+
 `verify` vs `scrub`: `scrub` checks chunks exist and hash-match (with cloud backends it
 forces remote read); `verify` checks every *file* decrypts. Run both.
+
+**Shared-dedup domain GC (`shared-gc`).** Every domain-member archive registers a
+holder link (`holders/<content_id>/<holder-id>`) *before* touching a shared chunk;
+`cairn <archive> shared-gc [--dry-run]` reclaims records+objects that NO member holds
+anymore (needs `CAIRN_SHARED_DEDUP_SECRET`). It refuses stores without the
+`holders/ENABLED` marker (pre-refcount archives — re-run their backups first).
+Second layer: a record with no holder *directory* at all is left alone as legacy even
+once that marker is lazily created — only records whose holder dir exists but is
+empty (links dropped: destroyed archive or stale reclaim) are reclaimed. Crash
+leftovers (`<cid>.reclaim-pending`) never rename back over a fresh re-published
+record, and a bonded holder only restores a quarantine whose object still exists.
+Archives deleted WITHOUT a destroy flow leave holder links forever: reclaim them with
+`--reclaim-stale-holders N` only when every archive that could idle longer than N days
+is known gone — an idle-but-live archive looks exactly like a destroyed one
+(re-registering on a dedup hit refreshes the link mtime, so "untouched N days"
+means the content has genuinely not been backed up for N days). When the destroyed
+archive's holder id was recorded (printed by `status` as "GC holder id"), drop its
+pins surgically instead: `shared-gc --drop-holder <id> [--dry-run]`, then reclaim.
+
+**Preferred lifecycle for live archives:** run `cairn <archive> heartbeat` (and
+`--dry-run` to preview) periodically — via cron, e.g. daily — so every holder link
+this archive owns is refreshed. A live archive that heartbeats at least once per
+`--reclaim-stale-holders-days N` window is never mistaken for a dead one.
+**Preferred lifecycle for destroyed archives:** run `cairn <archive> destroy-shared
+--i-accept-destroy` *before* deleting the database — it drops all pins immediately and
+makes the content reclaimable without any age heuristic. `destroy-shared` removes
+only the cross-archive pins, never the archive database or chunks.
 
 ## 4. Restore drill (run before trusting Cairn, then periodically)
 
@@ -192,3 +229,5 @@ without the master key — that is the ransomware protection; run it from a trus
 - **`backup` skips special files** (FIFO/socket/device) with a **WARNING**; use `--strict` to
   fail instead. Recreate specials out of band on restore. Regular files, dirs, symlinks,
   hardlinks, perms, mtimes, xattrs are preserved (`--preserve` for owner/timestamps/xattrs).
+  Extract refuses symlink targets that are absolute or contain `..` (anti-escape policy) —
+  such links are counted as restore failures (non-zero exit), not silently dropped.

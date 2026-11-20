@@ -64,7 +64,7 @@ impl From<r2d2::Error> for XattrError {
     }
 }
 
-pub type InodeInfo = (u32, u32, u32, u64, u32, i64, u32);
+pub type InodeInfo = (u32, u32, u32, u64, u32, i64, u32, u64);
 pub type FileChunkData = (String, usize, usize, Vec<u8>, i32, String);
 
 /// (name, inode_id, mode, node_hash) of one child, sorted by name — the unit
@@ -718,6 +718,7 @@ impl Db {
         gid: u32,
         size: u64,
         nlink: u32,
+        rdev: u64,
         parent: u64,
         name: &str,
         name_enc: Option<&[u8]>,
@@ -726,8 +727,8 @@ impl Db {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO inodes (mode, uid, gid, mtime_sec, mtime_nsec, size, nlink, rdev)
-             VALUES (?1, ?2, ?3, strftime('%s','now'), 0, ?4, ?5, 0)",
-            rusqlite::params![mode, uid, gid, size, nlink],
+             VALUES (?1, ?2, ?3, strftime('%s','now'), 0, ?4, ?5, ?6)",
+            rusqlite::params![mode, uid, gid, size, nlink, rdev as i64],
         )?;
         let ino = tx.last_insert_rowid() as u64;
         tx.execute(
@@ -755,7 +756,7 @@ impl Db {
 
     pub fn get_inode(&self, inode: u64) -> Result<Option<InodeInfo>> {
         let conn = self.pool.get()?;
-        let mut stmt = conn.prepare("SELECT mode, uid, gid, size, nlink, mtime_sec, mtime_nsec FROM inodes WHERE id = ?1 LIMIT 1")?;
+        let mut stmt = conn.prepare("SELECT mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, rdev FROM inodes WHERE id = ?1 LIMIT 1")?;
         let mut rows = stmt.query(rusqlite::params![inode])?;
         if let Some(row) = rows.next()? {
             Ok(Some((
@@ -766,6 +767,7 @@ impl Db {
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             )))
         } else {
             Ok(None)
@@ -773,12 +775,7 @@ impl Db {
     }
 
     pub fn get_inline_data(&self, ino: u64) -> rusqlite::Result<Option<Vec<u8>>> {
-        let conn = self.pool.get().map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(e.to_string()),
-            )
-        })?;
+        let conn = self.pool_conn()?;
         let mut stmt = conn.prepare("SELECT inline_data FROM inodes WHERE id = ?1 LIMIT 1")?;
         // Distinguish "no row" (legitimately no inline data) from a real DB error:
         // QueryReturnedNoRows → None; any other error propagates as EIO instead of
@@ -792,13 +789,21 @@ impl Db {
         }
     }
 
-    pub fn set_inline_data(&self, ino: u64, data: &[u8]) -> rusqlite::Result<()> {
-        let conn = self.pool.get().map_err(|e| {
+    /// Pool checkout with the crate-standard SqliteFailure error mapping
+    /// (dedup refactor #6).
+    fn pool_conn(
+        &self,
+    ) -> rusqlite::Result<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>> {
+        self.pool.get().map_err(|e| {
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
                 Some(e.to_string()),
             )
-        })?;
+        })
+    }
+
+    pub fn set_inline_data(&self, ino: u64, data: &[u8]) -> rusqlite::Result<()> {
+        let conn = self.pool_conn()?;
         if data.is_empty() {
             conn.execute(
                 "UPDATE inodes SET inline_data = NULL WHERE id = ?1",
@@ -819,12 +824,7 @@ impl Db {
     /// the file read as empty (chunks gone, inline not yet set) or hide live
     /// chunks (inline set, chunks not yet cleared). An empty slice stores NULL.
     pub fn set_inline_and_clear_chunks(&self, ino: u64, data: &[u8]) -> rusqlite::Result<()> {
-        let mut conn = self.pool.get().map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(e.to_string()),
-            )
-        })?;
+        let mut conn = self.pool_conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM file_chunks WHERE inode = ?1",
@@ -853,12 +853,7 @@ impl Db {
         data: &[u8],
         new_size: u64,
     ) -> rusqlite::Result<()> {
-        let mut conn = self.pool.get().map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(e.to_string()),
-            )
-        })?;
+        let mut conn = self.pool_conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM file_chunks WHERE inode = ?1",
@@ -897,12 +892,7 @@ impl Db {
                 Some(format!("truncate size {new_size} exceeds i64::MAX")),
             ));
         }
-        let mut conn = self.pool.get().map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(e.to_string()),
-            )
-        })?;
+        let mut conn = self.pool_conn()?;
         let tx = conn.transaction()?;
         // 1. The straddle chunk (the one that spans the new size) is shortened.
         //    The new plain_len = new_size - offset (how many bytes from this
@@ -945,12 +935,7 @@ impl Db {
         size: u64,
         digest: &[u8; 32],
     ) -> rusqlite::Result<()> {
-        let mut conn = self.pool.get().map_err(|e| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(e.to_string()),
-            )
-        })?;
+        let mut conn = self.pool_conn()?;
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM file_chunks WHERE inode = ?1",
@@ -1288,7 +1273,33 @@ impl Db {
         chunks: &[(u64, String, usize, i32)],
     ) -> Result<()> {
         let mut conn = self.pool.get()?;
-        let tx = conn.transaction()?;
+        // IMMEDIATE: the ref-validation SELECT below must run while we already
+        // hold the write lock (a DEFERRED tx would take a read snapshot first
+        // and fail with SQLITE_BUSY_SNAPSHOT against concurrent flushes —
+        // regression seen in concurrent_engine). Also serializes us against
+        // gc's remove_chunk_from_index_if_unreferenced.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Mirror guard: every new file_chunks reference must point at an
+        // existing chunk_index row. Without this check, a gc delete landing
+        // between the chunker's batch index insert and this transaction
+        // leaves a dangling ref — the INNER JOIN in get_file_chunks then
+        // silently DROPS the chunk (read gap / wrong bytes). If the check
+        // passes but gc commits first, this transaction's write upgrade fails
+        // with a snapshot conflict — loud error either way, never a silent gap.
+        {
+            let mut chk =
+                tx.prepare("SELECT EXISTS(SELECT 1 FROM chunk_index WHERE object_id = ?1)")?;
+            for (_, object_id, _, _) in chunks {
+                let exists: bool =
+                    chk.query_row(rusqlite::params![object_id.as_str()], |r| r.get(0))?;
+                if !exists {
+                    anyhow::bail!(
+                        "replace_file_chunks: no chunk_index row for object {object_id} \
+                         (chunk was garbage-collected mid-flush) — retry the write"
+                    );
+                }
+            }
+        }
         // Inline data is superseded by the chunks written below; clearing it in the
         // SAME transaction keeps the file readable if we crash mid-flush (either the
         // old inline data or the new chunks are visible, never neither).
@@ -1648,7 +1659,7 @@ impl Db {
     pub fn tree_root(&self) -> Result<Option<[u8; 32]>> {
         const ROOT: u64 = 1;
         match self.get_inode(ROOT)? {
-            Some((mode, _, _, _, _, _, _)) => self.node_hash(ROOT, "", mode),
+            Some((mode, _, _, _, _, _, _, _)) => self.node_hash(ROOT, "", mode),
             None => Ok(None),
         }
     }
@@ -2307,6 +2318,38 @@ impl Db {
         Ok(())
     }
 
+    /// TOCTOU fix for gc: re-check and delete in ONE transaction.
+    /// Deletes the chunk_index row only while no file_chunks row still
+    /// references it — a concurrent dedup-hit flush either commits its
+    /// reference first (we change 0 rows and must keep the blob), or inserts
+    /// after our commit and is rejected by replace_file_chunks' ref check.
+    /// The `upload_queue` clause (adversarial review 2026-11-18) keeps the row
+    /// alive when the same content was *just* re-enqueued for cloud upload
+    /// (enqueued before its file_chunks commit): deleting the index row then
+    /// strands the queue entry and fails the new flush's ref validation.
+    /// Returns true only when the row was actually deleted.
+    pub fn remove_chunk_from_index_if_unreferenced(&self, object_id: &str) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let removed = tx.execute(
+            "DELETE FROM chunk_index WHERE object_id = ?1 \
+             AND NOT EXISTS (SELECT 1 FROM file_chunks WHERE object_id = ?1) \
+             AND NOT EXISTS (SELECT 1 FROM upload_queue WHERE hash_key = ?1)",
+            rusqlite::params![object_id],
+        )?;
+        tx.commit()?;
+        Ok(removed == 1)
+    }
+
+    /// Cheap single-key membership test for the upload queue (cache sweeper
+    /// re-checks per eviction — the queue can gain entries mid-pass).
+    pub fn is_in_upload_queue(&self, hash_key: &str) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT 1 FROM upload_queue WHERE hash_key = ?1 LIMIT 1")?;
+        let mut rows = stmt.query(rusqlite::params![hash_key])?;
+        Ok(rows.next()?.is_some())
+    }
+
     /// Distinct chunk object ids referenced by any file. Used by `scrub` to verify
     /// each physical chunk once instead of once per file reference (dedup makes
     /// the per-reference count N× the work).
@@ -2324,7 +2367,9 @@ impl Db {
     /// Distinct chunk objects present in `file_chunks`, joined with their sealed
     /// chunk-key record and metadata from `chunk_index`. Used by `scrub` so it
     /// can validate more than the ciphertext hash.
-    pub fn get_all_distinct_chunk_metadata(&self) -> Result<Vec<(String, Vec<u8>, i32, String, bool)>> {
+    pub fn get_all_distinct_chunk_metadata(
+        &self,
+    ) -> Result<Vec<(String, Vec<u8>, i32, String, bool)>> {
         let conn = self.pool.get()?;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT f.object_id, c.sym_key, c.comp_type, c.cipher, c.domain
@@ -2492,7 +2537,29 @@ impl Db {
         Ok(stored)
     }
 
-    /// Read a config value. Returns `Ok(None)` ONLY for "key not set"
+    /// Atomically increment a numeric config value and return the new value.
+    /// Uses an IMMEDIATE transaction so concurrent pushers (two engines or
+    /// processes) cannot both read N and write N+1 (lost update). round 7.
+    pub fn increment_config(&self, key: &str, default: u64) -> Result<u64> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let cur: u64 = tx
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default);
+        let next = cur.saturating_add(1);
+        tx.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, next.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(next)
+    }
     /// (`SQLITE_ROW` returned zero rows, surfaced as `QueryReturnedNoRows`);
     /// any other DB error propagates so a busy / corrupt / IO error is not
     /// misclassified as a missing key. same discipline as
@@ -3014,10 +3081,10 @@ mod tests {
     fn test_get_inodes_using_chunk() {
         let db = test_db();
         let a = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, "a", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 0, 1, "a", None)
             .unwrap();
         let b = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, "b", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 0, 1, "b", None)
             .unwrap();
         // inode a references obj1 twice (two offsets) + obj2 once; inode b references obj1.
         db.insert_file_chunk(a, 0, "obj1", 100, 0).unwrap();
@@ -3047,7 +3114,7 @@ mod tests {
     fn test_delete_inode_removes_extended_attrs() {
         let db = test_db();
         let ino = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, "f", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 0, 1, "f", None)
             .unwrap();
         db.set_xattr_with_flags(ino, "user.k", b"v", XattrFlag::None)
             .unwrap();
@@ -3445,7 +3512,7 @@ mod tests {
     fn snapshot_capture_is_point_in_time_and_immutable() {
         let db = test_db();
         let ino = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, "f", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 0, 1, "f", None)
             .unwrap();
         db.insert_chunk_indices_batch(&[(
             "obj-a".to_string(),
@@ -3503,7 +3570,7 @@ mod tests {
         let tdir = tempfile::tempdir().unwrap();
         let db = Db::new(tdir.path().join("t.db").to_str().unwrap(), None).unwrap();
         let ino = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, "busy", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 0, 1, "busy", None)
             .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -3586,10 +3653,10 @@ mod tests {
     fn tree_root_acts_as_equality_oracle_and_persists_in_snapshot() {
         let db = test_db();
         let dir = db
-            .insert_inode_with_dentry(libc::S_IFDIR | 0o755, 0, 0, 0, 2, 1, "d1", None)
+            .insert_inode_with_dentry(libc::S_IFDIR | 0o755, 0, 0, 0, 2, 0, 1, "d1", None)
             .unwrap();
         let f = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, dir, "f", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 0, dir, "f", None)
             .unwrap();
         db.set_file_digest(f, &[1u8; 32]).unwrap();
 
@@ -3620,7 +3687,7 @@ mod tests {
     fn tree_root_is_none_when_a_file_lacks_digest() {
         let db = test_db();
         let f = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 1, "plain", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 0, 1, "plain", None)
             .unwrap();
         // No file_digest for "plain" → the tree cannot be authenticated.
         assert!(db.tree_root().unwrap().is_none());
@@ -3634,7 +3701,7 @@ mod tests {
     fn snapshot_root_matches_the_frozen_copy() {
         let db = test_db();
         let f = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 1, "l", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 0, 1, "l", None)
             .unwrap();
         db.set_file_digest(f, &[7u8; 32]).unwrap();
 
@@ -3684,6 +3751,7 @@ mod tests {
                     0,
                     0,
                     2,
+                    0,
                     parent,
                     &format!("d{i}"),
                     None,
@@ -3691,7 +3759,7 @@ mod tests {
                 .unwrap();
         }
         let f = db
-            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, parent, "f", None)
+            .insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 3, 1, 0, parent, "f", None)
             .unwrap();
         db.set_file_digest(f, &[9u8; 32]).unwrap();
 

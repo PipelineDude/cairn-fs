@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/cairn-seal", "crates/cairn-index", "crates/cairn-cdc", "crates/cairn-store", "crates/cairn-keys", "crates/cairn-core", "crates/cairn-fuse"]
+exclude = ["fuzz"]
 
 [package]
 name = "cairn"
@@ -64,6 +65,9 @@ mockall = "0.12"
 tokio-test = "0.4"
 # Integration tests generate age keypairs directly (matches cairn-seal's 0.11.x pin).
 age = "0.11"
+# Tamper-simulation in security regressions: raw file_chunks inserts that
+# bypass the writer-side ref validation (must match cairn-index's pin).
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
 
 [features]
 # `cloud-storage` pulls in the S3/GCS backend stack (opendal + HTTP/TLS). Building

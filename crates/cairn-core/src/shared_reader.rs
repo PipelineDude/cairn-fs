@@ -16,7 +16,7 @@ use anyhow::{Result, anyhow};
 use zeroize::Zeroizing;
 
 pub struct SharedChunkReader {
-    domain_key: Option<[u8; 32]>,
+    domain_key: Option<Zeroizing<[u8; 32]>>,
     db: Arc<cairn_index::Db>,
 }
 
@@ -30,13 +30,14 @@ impl SharedChunkReader {
                 db,
             });
         };
-        let secret: Vec<u8> = if let Some(path) = db.get_config("dedup_shared_secret_file")? {
-            std::fs::read(&path)
-                .map_err(|e| anyhow!("cannot read shared-dedup secret file {path}: {e}"))?
-        } else if let Ok(env) = std::env::var("CAIRN_SHARED_DEDUP_SECRET") {
-            env.into_bytes()
+        let secret: Zeroizing<Vec<u8>> = if let Ok(env) = std::env::var("CAIRN_SHARED_DEDUP_SECRET")
+        {
+            Zeroizing::new(env.into_bytes())
         } else {
-            return Err(anyhow!("shared-dedup archive has no secret-file path and no CAIRN_SHARED_DEDUP_SECRET env"));
+            return Err(anyhow!(
+                "shared-dedup reads require CAIRN_SHARED_DEDUP_SECRET — the secret-file \
+                 path is no longer stored in the archive config (password-holder boundary)"
+            ));
         };
         let expected = db
             .get_config("dedup_shared_namespace")?
@@ -45,7 +46,9 @@ impl SharedChunkReader {
             anyhow::bail!("shared-dedup secret does not match this archive's configured domain");
         }
         Ok(Self {
-            domain_key: Some(cairn_seal::shared_domain_wrapping_key(&secret)),
+            domain_key: Some(Zeroizing::new(cairn_seal::shared_domain_wrapping_key(
+                &secret,
+            ))),
             db,
         })
     }
@@ -74,7 +77,7 @@ impl SharedChunkReader {
         comp_type: u8,
         cipher_algo: &str,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        let Some(domain_key) = self.domain_key else {
+        let Some(domain_key) = self.domain_key.as_ref() else {
             return Ok(None);
         };
         if !self.db.get_chunk_domain(object_id)? {
@@ -162,7 +165,7 @@ mod tests {
         let plaintext_vec = b"reader bridge plaintext payload".repeat(2);
         let plaintext = plaintext_vec.as_slice();
         let secret = b"shared domain secret";
-        let domain_key = cairn_seal::shared_domain_wrapping_key(secret);
+        let domain_key = zeroize::Zeroizing::new(cairn_seal::shared_domain_wrapping_key(secret));
         let sealed = ctx.seal_chunk_shared(plaintext, None, &domain_key).unwrap();
         insert_chunk(&db, &sealed.object_id, &sealed.domain_wrapped_key, true);
 
@@ -193,7 +196,8 @@ mod tests {
         let sealed = ctx.seal_chunk_shared(plaintext, None, &domain_key).unwrap();
         insert_chunk(&db, &sealed.object_id, &sealed.domain_wrapped_key, true);
 
-        let wrong = cairn_seal::shared_domain_wrapping_key(b"team-b secret");
+        let wrong =
+            zeroize::Zeroizing::new(cairn_seal::shared_domain_wrapping_key(b"team-b secret"));
         let reader = SharedChunkReader {
             domain_key: Some(wrong),
             db,
@@ -216,7 +220,8 @@ mod tests {
         let (_d, db) = temp_db();
         let ctx = seal_ctx();
         let plaintext = b"verifiable canonical payload";
-        let domain_key = cairn_seal::shared_domain_wrapping_key(b"domain secret");
+        let domain_key =
+            zeroize::Zeroizing::new(cairn_seal::shared_domain_wrapping_key(b"domain secret"));
         let sealed = ctx.seal_chunk_shared(plaintext, None, &domain_key).unwrap();
         insert_chunk(&db, &sealed.object_id, &sealed.domain_wrapped_key, true);
 

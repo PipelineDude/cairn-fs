@@ -278,6 +278,7 @@ async fn test_hide_names_corrupt_name_enc_degrades_to_hash() {
             0,
             0,
             1,
+            0,
             1,
             bogus_key,
             Some(&corrupt_enc),

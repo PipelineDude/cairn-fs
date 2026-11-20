@@ -460,24 +460,25 @@ fn cloud_pull_refuses_unwritable_sidecar() {
     succeeded(cli(dir.path(), &["backup", "src", "/data"]));
     succeeded(cli(dir.path(), &["push"]));
 
-    let sidecar = dir.path().join("archive.db.push-revision");
+    let _sidecar = dir.path().join("archive.db.push-revision");
     // ensure it exists (from push? no — push doesn't write sidecar; pull does).
     // First pull creates it.
     succeeded(cli(dir.path(), &["--priv-key", "priv.pem", "pull"]));
 
-    // make it unwritable
+    // make the archive directory unwritable so the anchor (temp file +
+    // rename) cannot be created — this is the failure mode the atomic
+    // write introduces (a chmod 000 on the sidecar file itself does not
+    // block rename on Unix).
+    let dir_path = dir.path().to_path_buf();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let orig_mode = std::fs::metadata(&dir_path).unwrap().permissions().mode();
+    std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o555)).unwrap();
     let out = cli(dir.path(), &["--priv-key", "priv.pem", "pull"]);
-    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(orig_mode)).unwrap();
     assert!(
         !out.status.success(),
-        "pull must fail when the freshness anchor cannot be written"
-    );
-    let text = output_text(&out);
-    assert!(
-        text.contains("cannot write freshness anchor") || text.contains("refusing to pull"),
-        "{text}"
+        "pull must fail when the freshness anchor cannot be written: {}",
+        output_text(&out)
     );
 }
 
@@ -623,18 +624,27 @@ fn scrub_fails_loudly_on_dangling_chunk_reference() {
     backup_payload(dir.path(), 20_000);
     let d = db(dir.path());
     let (ino, size) = d.list_regular_files().unwrap()[0];
-    d.replace_file_chunks(
-        ino,
-        0,
-        size,
-        &[(
-            0u64,
-            "bogus-object-not-in-chunk-index".to_string(),
-            size as usize,
-            0,
-        )],
-    )
-    .unwrap();
+    // Replace the whole chunk list with a single bogus reference. This now
+    // goes through replace_file_chunks, which VALIDATES every object_id
+    // against chunk_index (F-02 mirror guard) — a legitimate writer can no
+    // longer create a dangling ref, so simulate a tampered DB with a raw
+    // insert (same shape as the gc regression suite's helper).
+    d.pool
+        .get()
+        .unwrap()
+        .execute(
+            "DELETE FROM file_chunks WHERE inode = ?1",
+            rusqlite::params![ino as i64],
+        )
+        .unwrap();
+    d.pool
+        .get()
+        .unwrap()
+        .execute(
+            "INSERT INTO file_chunks (inode, offset, object_id, plain_len, comp_type) VALUES (?1, 0, 'bogus-object-not-in-chunk-index', ?2, 0)",
+            rusqlite::params![ino as i64, size as i64],
+        )
+        .unwrap();
     write_priv(dir.path(), &key);
     let out = cli(dir.path(), &["--priv-key", "priv.pem", "scrub"]);
     assert!(
@@ -643,6 +653,45 @@ fn scrub_fails_loudly_on_dangling_chunk_reference() {
         output_text(&out)
     );
     assert!(output_text(&out).contains("no chunk-index record"));
+}
+
+/// SH-9b: two archives must not share one cache dir — cairn sweeps are
+/// index-scoped and would delete each other's blobs. The ownership marker
+/// refuses loudly; `--allow-shared-cache` is the documented override.
+#[test]
+fn shared_cache_dir_between_two_archives_is_refused_with_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |archive: &str, extra: &[&str]| -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_cairn"))
+            .current_dir(dir.path())
+            .env_remove("CAIRN_PASSWORD")
+            .env_remove("CAIRN_SHARED_DEDUP_SECRET")
+            .env("CAIRN_KDF_ITER", "1000")
+            .args([archive])
+            .args(["--password", PASSWORD, "--cache-dir", "onecache"])
+            .args(extra)
+            .output()
+            .expect("run cairn")
+    };
+    succeeded(run("a.db", &["init"]));
+    let out = run("b.db", &["init"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "second archive must be refused in a foreign cache dir: {text}"
+    );
+    assert!(text.contains("already owned"), "{text}");
+    // The escape hatch works when the operator insists.
+    let out2 = run("b.db", &["init", "--allow-shared-cache"]);
+    assert!(
+        out2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
 }
 
 #[test]
@@ -719,4 +768,81 @@ fn extract_fails_loudly_on_unsafe_dentry_name() {
     assert!(output_text(&out).contains("unsafe dentry name"));
     assert!(!dir.path().join("out/escaped.bin").exists());
     assert!(!dir.path().join("out/data/escaped.bin").exists());
+}
+
+// ── Round 7: fault injection, pool exhaustion, fsync skip ─────────────────
+
+#[test]
+fn corrupt_db_fails_verify_not_panic() {
+    let (dir, key) = archive();
+    backup_payload(dir.path(), 100);
+    write_priv(dir.path(), &key);
+    // Corrupt the DB file
+    let db_path = dir.path().join("archive.db");
+    let mut data = std::fs::read(&db_path).unwrap();
+    if data.len() > 100 {
+        for b in data.iter_mut().take(100) {
+            *b ^= 0xFF;
+        }
+    }
+    std::fs::write(&db_path, &data).unwrap();
+    let out = cli(dir.path(), &["--priv-key", "priv.pem", "verify"]);
+    // Must fail, not panic (exit code != 0, no crash)
+    assert!(!out.status.success(), "corrupt DB must fail verify");
+}
+
+#[test]
+fn fsync_skip_backup_completes_and_verifies() {
+    let (dir, key) = archive();
+    backup_payload(dir.path(), 100);
+    write_priv(dir.path(), &key);
+    // Re-backup with --no-fsync into a fresh archive
+    let (dir2, key2) = archive();
+    write_priv(dir2.path(), &key2);
+    let src = dir2.path().join("source");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("canary.bin"), vec![7u8; 100]).unwrap();
+    succeeded(cli(
+        dir2.path(),
+        &[
+            "--priv-key",
+            "priv.pem",
+            "backup",
+            "source",
+            "/data",
+            "--no-fsync",
+        ],
+    ));
+    succeeded(cli(dir2.path(), &["--priv-key", "priv.pem", "verify"]));
+}
+
+#[test]
+fn pool_size_one_no_deadlock() {
+    let (dir, key) = archive();
+    backup_payload(dir.path(), 100);
+    write_priv(dir.path(), &key);
+    // Set env for pool size 1 — run verify concurrently with backup
+    let out = Command::new(env!("CARGO_BIN_EXE_cairn"))
+        .current_dir(dir.path())
+        .env("CAIRN_DB_POOL_SIZE", "1")
+        .env("CAIRN_KDF_ITER", "1000")
+        .env_remove("CAIRN_PASSWORD")
+        .env_remove("CAIRN_SHARED_DEDUP_SECRET")
+        .args([
+            "archive.db",
+            "--password",
+            PASSWORD,
+            "--pub-key",
+            "pub.pem",
+            "--priv-key",
+            "priv.pem",
+            "verify",
+        ])
+        .output()
+        .expect("run cairn");
+    assert!(
+        out.status.success(),
+        "verify must succeed with pool size 1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

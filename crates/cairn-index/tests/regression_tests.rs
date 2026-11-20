@@ -11,7 +11,7 @@ fn db() -> (Db, TempDir) {
 }
 
 fn new_file(db: &Db, name: &str) -> u64 {
-    db.insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 1, name, None)
+    db.insert_inode_with_dentry(libc::S_IFREG | 0o644, 0, 0, 0, 1, 0, 1, name, None)
         .unwrap()
 }
 

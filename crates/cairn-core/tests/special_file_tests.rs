@@ -399,7 +399,7 @@ fn test_chunk_index_created_at_default() {
     let db = cairn_index::Db::new(dir.path().join("test.db").to_str().unwrap(), None).unwrap();
 
     // Insert via Db API — created_at should be set by the DEFAULT constraint.
-    db.insert_inode_with_dentry(33206, 1000, 1000, 0, 1, 1, "f", None)
+    db.insert_inode_with_dentry(33206, 1000, 1000, 0, 1, 0, 1, "f", None)
         .unwrap();
     let ino = db.get_dentry_inode(1, "f").unwrap().expect("dentry");
     // Insert directly into chunk_index so the FK in file_chunks is satisfied.

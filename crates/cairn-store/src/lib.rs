@@ -702,7 +702,17 @@ pub async fn upload_chunk_from_cache_impl(
     raid_mode: &str,
     rate_limiter: &Option<std::sync::Arc<leaky_bucket::RateLimiter>>,
 ) -> anyhow::Result<()> {
-    let data = cacache::read(cache_dir, hash_key).await?;
+    let data = cacache::read(cache_dir, hash_key).await.map_err(|e| {
+        // Residual race: the blob vanished between enqueue and upload (power
+        // loss / cache damage — the queue row survives, the data does not).
+        // Loud and explicit so an operator can re-backup the source content;
+        // `verify --force-remote` proves whether the cloud copy exists.
+        anyhow::anyhow!(
+            "upload queue entry {hash_key} has NO local blob ({e}) — the cached chunk was lost \
+             before it reached the cloud; re-backup the source content (the queue entry is kept \
+             and retried; `verify --force-remote` shows the gap)"
+        )
+    })?;
     // verify the cache blob against its content hash BEFORE propagating to
     // the cloud. A bit-rotted / partially-written cache entry would otherwise be
     // pushed to every backend identically — RAID reconstruction cannot recover

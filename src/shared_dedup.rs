@@ -79,14 +79,29 @@ pub fn resolve(
     // is the fallback for background/long-running processes that must not
     // require re-typing the domain secret on every invocation.
     let secret: Vec<u8> = if let Some(path) = secret_file {
-        std::fs::read(path).map_err(|e| {
+        // Trailing CR/LF are stripped (same convention as `--password-file` and
+        // the runtime CAIRN_SHARED_DEDUP_SECRET env read): a secret stored in
+        // an editor-written file and the same secret exported via `$(cat f)`
+        // must derive the SAME namespace — the E2E smoke 2026-11-18 caught
+        // this mismatch. All other bytes are significant.
+        let mut bytes = std::fs::read(path).map_err(|e| {
             format!(
                 "cannot read --shared-dedup-secret-file {}: {e}",
                 path.display()
             )
-        })?
+        })?;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        bytes
     } else if let Some(env) = env_secret {
-        env
+        // Same trailing-CR/LF normalization as the file branch and the engine's
+        // runtime env read (see cairn-core shared_dedup_write_config).
+        let mut bytes = env;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        bytes
     } else {
         return Err(
             "--shared-dedup-domain requires a secret: --shared-dedup-secret-file, or \
@@ -100,7 +115,7 @@ pub fn resolve(
         );
     }
     // A short secret is brute-forceable against the persisted fingerprint
-    // (derive_namespace stores blake3(secret)[..16] in the index). Require a
+    // (fingerprint_secret stores blake3(secret)[..32] in the index). Require a
     // high-entropy secret of at least 32 bytes; prefer 32 random bytes.
     if secret.len() < 32 {
         return Err(

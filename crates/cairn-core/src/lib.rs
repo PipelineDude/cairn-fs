@@ -331,7 +331,7 @@ impl Drop for FileWriteState {
     }
 }
 
-/// Build a `FileAttr` from the (mode, uid, gid, size, nlink, mtime_sec, mtime_nsec)
+/// Build a `FileAttr` from the (mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, rdev)
 /// row returned by `db.get_inode()`:
 /// - `mtime` is now derived from the stored `mtime_sec` / `mtime_nsec` (was
 ///   `UNIX_EPOCH` in every FUSE op); `atime` and `ctime` fall back to
@@ -498,6 +498,43 @@ impl Drop for CheckpointLock {
     }
 }
 
+/// Recreate a special file (FIFO/CHR/BLK) via mknod(2) with the stored rdev.
+/// SOCK cannot be created with mknod(2) — callers must pre-check and skip.
+fn recreate_special_file(mode: u32, rdev: u64, path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes().to_vec())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let rc = unsafe { libc::mknod(c_path.as_ptr(), mode, rdev) };
+        if rc != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "extract unsupported on non-unix",
+        ))
+    }
+}
+
+/// Whether a dentry name is safe to use as a filesystem path component.
+/// Rejects absolute paths, parent/current components, and '/'.
+fn is_dentry_name_safe(name: &str) -> bool {
+    let p = std::path::Path::new(name);
+    !p.is_absolute()
+        && !p.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        && !name.contains('/')
+}
+
 impl CairnEngine {
     /// Export one frozen snapshot and every ciphertext object it references.
     /// The bundle is opaque: no archive key or plaintext is required to copy it.
@@ -628,19 +665,25 @@ impl CairnEngine {
         // shared reader is unnecessary and reading its secret file only risks
         // bricking the whole archive on a missing sidecar.
         if self.db.get_chunk_domain(object_id).unwrap_or(false) {
-            if let Ok(reader) = shared_reader::SharedChunkReader::from_archive_config(self.db.clone()) {
-                if reader.domain_mode_active() {
-                    if let Some(pt) = reader.try_decrypt_domain(
-                        &self.crypto,
-                        object_id,
-                        ciphertext,
-                        wrapped_key,
-                        comp_type,
-                        cipher_algo,
-                    )? {
-                        return Ok(pt);
-                    }
+            // SH-6: this chunk is domain-flagged, so a shared-reader failure
+            // is the actual fault — surface it instead of silently falling
+            // through to archive-scope decryption (which fails with a
+            // misleading "wrong key" error and hides the real cause).
+            let reader = shared_reader::SharedChunkReader::from_archive_config(self.db.clone())?;
+            if reader.domain_mode_active() {
+                if let Some(pt) = reader.try_decrypt_domain(
+                    &self.crypto,
+                    object_id,
+                    ciphertext,
+                    wrapped_key,
+                    comp_type,
+                    cipher_algo,
+                )? {
+                    return Ok(pt);
                 }
+                anyhow::bail!(
+                    "domain-flagged chunk {object_id} did not decrypt through the domain path"
+                );
             }
         }
         self.crypto.decrypt_sealed_chunk(ciphertext, wrapped_key)
@@ -660,7 +703,6 @@ impl CairnEngine {
             .db
             .get_config("dedup_shared_store_dir")?
             .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no shared store directory"))?;
-        let secret_path = self.db.get_config("dedup_shared_secret_file")?;
         let expected = self
             .db
             .get_config("dedup_shared_namespace")?
@@ -674,7 +716,14 @@ impl CairnEngine {
             .filter(|s| !s.is_empty())
         {
             Some(env_secret) => {
-                let bytes = env_secret.into_bytes();
+                // Match the `--shared-dedup-secret-file` convention: file reads
+                // are raw bytes, but shells strip trailing newlines from `$(cat
+                // file)` — accept both by trimming trailing CR/LF only (E2E
+                // smoke 2026-11-18 caught the file-vs-env mismatch otherwise).
+                let bytes = env_secret
+                    .trim_end_matches(['\r', '\n'])
+                    .as_bytes()
+                    .to_vec();
                 if cairn_store::shared_dedup::derive_namespace(&domain_id, &bytes) != expected {
                     anyhow::bail!(
                         "CAIRN_SHARED_DEDUP_SECRET does not match this archive's configured domain"
@@ -683,23 +732,38 @@ impl CairnEngine {
                 bytes
             }
             None => {
-                let secret_path = secret_path.ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no secret source: set CAIRN_SHARED_DEDUP_SECRET (background) or configure a secret file at init"))?;
-                let secret = std::fs::read(&secret_path).map_err(|e| {
-                    anyhow::anyhow!("cannot read shared-dedup secret file {secret_path}: {e}")
-                })?;
-                if secret.is_empty() {
-                    anyhow::bail!("shared-dedup secret file {secret_path} is empty");
-                }
-                secret
+                anyhow::bail!(
+                    "shared-dedup writes require CAIRN_SHARED_DEDUP_SECRET — the secret-file \
+                     path is no longer stored in the archive config (password-holder boundary)"
+                );
             }
         };
         if cairn_store::shared_dedup::derive_namespace(&domain_id, &secret) != expected {
             anyhow::bail!("shared-dedup secret does not match this archive's configured domain");
         }
+        // Domain GC: random per-archive holder id, persisted in the archive
+        // config on first use (archives created before this feature pick it up
+        // lazily; holder links are named by it — a random id avoids leaking
+        // archive identity into the shared domain store).
+        let mut bytes = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        let candidate: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let holder_id = self
+            .db
+            .set_config_if_absent("dedup_holder_id", &candidate)?;
+        // Concurrent writers converge on the stored value; an empty stored
+        // value is unusable — overwrite once.
+        let holder_id = if holder_id.is_empty() {
+            self.db.set_config("dedup_holder_id", &candidate)?;
+            candidate
+        } else {
+            holder_id
+        };
         Ok(Some(cairn_cdc::shared::SharedDedupConfig {
             records_dir: store_dir,
             domain_id,
-            domain_secret: secret,
+            domain_secret: zeroize::Zeroizing::new(secret),
+            holder_id,
         }))
     }
 
@@ -716,7 +780,7 @@ impl CairnEngine {
         state.data.shrink_to_fit();
         state.buffered_bytes = 0;
         self.global_write_buffer_bytes
-            .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(len, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Return (or create) the per-inode write lock.
@@ -1451,7 +1515,7 @@ impl CairnEngine {
     pub async fn verify_file_stable(&self, ino: u64) -> VerifyOutcome {
         fn stat_tuple(db: &cairn_index::Db, ino: u64) -> Option<(u64, u64, u64)> {
             let inner = db.get_inode(ino).ok()??;
-            let (mode, _uid, _gid, size, _nlink, mtime_sec, mtime_nsec) = inner;
+            let (mode, _uid, _gid, size, _nlink, mtime_sec, mtime_nsec, _rdev) = inner;
             if (mode & 0o170000) != 0o100000 {
                 return None;
             }
@@ -1574,11 +1638,7 @@ impl CairnEngine {
         // Guard against path traversal / arbitrary read via a tampered index:
         // object_ids must be 64 hex chars (blake3). Anything else is refused
         // before it reaches the store's path construction.
-        if hash_key.len() != 64
-            || !hash_key
-                .chars()
-                .all(|c| c.is_ascii_hexdigit())
-        {
+        if hash_key.len() != 64 || !hash_key.chars().all(|c| c.is_ascii_hexdigit()) {
             anyhow::bail!("invalid object id (not a 64-hex blake3 hash): {hash_key:?}");
         }
         match self
@@ -1689,13 +1749,7 @@ impl CairnEngine {
         let (push_revision, archive_id): (u64, String) = {
             let db = self.db.clone();
             tokio::task::spawn_blocking(move || {
-                let cur: u64 = db
-                    .get_config("push_revision")?
-                    .unwrap_or_default()
-                    .parse()
-                    .unwrap_or(0);
-                let next = cur.saturating_add(1);
-                db.set_config("push_revision", &next.to_string())?;
+                let next = db.increment_config("push_revision", 0)?;
                 let aid = db.snapshot_history()?.archive_id;
                 Ok::<_, anyhow::Error>((next, aid))
             })
@@ -1823,7 +1877,9 @@ pub async fn restore_index_from_cloud(
             }
         };
         if d.len() < 4 {
-            tracing::warn!("restore_index_from_cloud: blob too small from this backend, trying the next");
+            tracing::warn!(
+                "restore_index_from_cloud: blob too small from this backend, trying the next"
+            );
             continue;
         }
         let wk_len = u16::from_le_bytes([d[0], d[1]]) as usize;
@@ -1861,8 +1917,9 @@ pub async fn restore_index_from_cloud(
         }
     }
 
-    let manifest_bytes = manifest_bytes
-        .ok_or_else(|| anyhow::anyhow!("Failed to download/decrypt index backup from any S3 operator"))?;
+    let manifest_bytes = manifest_bytes.ok_or_else(|| {
+        anyhow::anyhow!("Failed to download/decrypt index backup from any S3 operator")
+    })?;
     let data = chosen_data.unwrap();
     // Re-parse (already validated) for the rest of the flow; reuse d.
     let wk_len = u16::from_le_bytes([data[0], data[1]]) as usize;
@@ -1882,6 +1939,10 @@ pub async fn restore_index_from_cloud(
     // so far; a missing sidecar means first pull (accepted).
     let sidecar = format!("{}.push-revision", archive_path);
     let sidecar_existed = std::path::Path::new(&sidecar).exists();
+    // Serialize sidecar read/gate/write across concurrent pulls in the same
+    // process (cross-process is already serialized by the archive flock).
+    static SIDECAR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _sidecar_guard = SIDECAR_LOCK.lock().await;
     let (stored_rev, stored_id): (u64, String) = match std::fs::read_to_string(&sidecar) {
         Ok(s) => {
             let mut lines = s.lines();
@@ -1915,15 +1976,34 @@ pub async fn restore_index_from_cloud(
     use cairn_store::ChunkStore;
     let store = cairn_store::CairnStore::new(cache_dir.to_string(), operators.to_vec(), None);
 
-    let mut db_bytes = Vec::new();
-    for chunk in manifest.chunks {
-        let cipher = store
-            .fetch_chunk(&chunk.hash, raid_mode, false, false, false)
-            .await?;
-        let dec = crypto
-            .decrypt_sealed_chunk(&cipher, &chunk.wrapped_key)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt index chunk {}: {}", chunk.hash, e))?;
-        db_bytes.extend_from_slice(&dec);
+    // Stream the decrypted index straight into a temp file (published by
+    // the rename below): the whole DB is never assembled in RAM, so an
+    // oversized chunk list in a manifest cannot OOM the pull.
+    let db_tmp_parent = std::path::Path::new(archive_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut db_tmp = tempfile::NamedTempFile::new_in(db_tmp_parent)
+        .map_err(|e| anyhow::anyhow!("cannot create temp file for index restore: {e}"))?;
+    let mut total_len: u64 = 0;
+    {
+        use std::io::Write;
+        for chunk in manifest.chunks {
+            let cipher = store
+                .fetch_chunk(&chunk.hash, raid_mode, false, false, false)
+                .await?;
+            let dec = crypto
+                .decrypt_sealed_chunk(&cipher, &chunk.wrapped_key)
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to decrypt index chunk {}: {}", chunk.hash, e)
+                })?;
+            total_len += dec.len() as u64;
+            db_tmp.as_file_mut().write_all(&dec)?;
+        }
+    }
+    // A zero-chunk manifest would brick the archive with an empty .db —
+    // refuse it (a legitimate push always carries chunk data).
+    if total_len == 0 {
+        anyhow::bail!("index manifest lists no chunk data — refusing to write an empty index");
     }
 
     // Anchor BEFORE overwriting the live index: if the sidecar cannot be
@@ -1939,24 +2019,31 @@ pub async fn restore_index_from_cloud(
     } else {
         manifest.archive_id.clone()
     };
-    std::fs::write(&sidecar, format!("{}\n{}", new_rev, new_id)).map_err(|e| {
-        anyhow::anyhow!("cannot write freshness anchor {sidecar:?} — refusing to pull: {e}")
-    })?;
-
-    // Atomic overwrite: a crash mid-write used to leave a truncated
-    // archive.db (a plain std::fs::write truncates the live file first).
-    // Write to a temp file in the same directory, then rename.
-    let db_tmp = tempfile::NamedTempFile::new_in(
+    let sidecar_tmp = tempfile::NamedTempFile::new_in(
         std::path::Path::new(archive_path)
             .parent()
             .unwrap_or_else(|| std::path::Path::new(".")),
     )
-    .map_err(|e| anyhow::anyhow!("cannot create temp file for index restore: {e}"))?;
-    std::fs::write(db_tmp.path(), db_bytes)?;
+    .map_err(|e| anyhow::anyhow!("cannot create temp file for sidecar: {e}"))?;
+    std::fs::write(sidecar_tmp.path(), format!("{}\n{}", new_rev, new_id))?;
+    std::fs::rename(sidecar_tmp.path(), &sidecar).map_err(|e| {
+        anyhow::anyhow!("cannot write freshness anchor {sidecar:?} — refusing to pull: {e}")
+    })?;
+
+    // Atomic overwrite: the streamed temp file stays invisible until this
+    // rename — a crash mid-write never leaves a truncated archive.db.
+    // Flush/sync happens only now, after the freshness anchor is durable
+    // (fail-closed: an anchor write failure aborts before the live index
+    // is touched).
+    {
+        use std::io::Write;
+        db_tmp.as_file_mut().flush()?;
+        db_tmp.as_file_mut().sync_all()?;
+    }
     std::fs::rename(db_tmp.path(), archive_path)?;
 
     tracing::info!("Successfully restored index database to {}", archive_path);
-    println!("Pulled index revision {} (archive {}).", new_rev, new_id);
+    tracing::info!("Pulled index revision {} (archive {}).", new_rev, new_id);
     if !sidecar_existed {
         tracing::warn!(
             "No freshness anchor found — this is the first pull; accepted revision {}.",
@@ -2330,6 +2417,13 @@ impl CairnEngine {
         if cp_seq == seq && cp_root != root {
             anyhow::bail!("snapshot root does not match the trusted checkpoint (tampered)");
         }
+        if seq > cp_seq {
+            tracing::warn!(
+                "snapshot {snap_id} (seq {seq}) is NEWER than the checkpoint (seq {cp_seq}) — \
+                 its root cannot be verified against a trusted anchor; proceeding only because \
+                 --i-accept-non-atomic was given"
+            );
+        }
         Ok(())
     }
 
@@ -2378,8 +2472,8 @@ impl CairnEngine {
                     .ok_or_else(|| anyhow::anyhow!("non-UTF-8 temp path"))?;
                 db.extract_snapshot(snap_id, p)
             })
-                .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
         }
         let snap_db = {
             let db = self.db.clone();
@@ -2444,7 +2538,7 @@ impl CairnEngine {
             tokio::task::spawn_blocking(move || db.get_inode(i))
                 .await
                 .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??
-                .map(|(_, _, _, size, _, _, _)| size)
+                .map(|(_, _, _, size, _, _, _, _)| size)
                 .ok_or_else(|| anyhow::anyhow!("inode {ino} missing"))?
         };
         let mut fh = crate::hashing::FileHasher::new();
@@ -2487,7 +2581,7 @@ impl CairnEngine {
             };
             if i == comps.len() - 1 {
                 let mode = match db.get_inode(ino)? {
-                    Some((mode, _, _, _, _, _, _)) => mode,
+                    Some((mode, _, _, _, _, _, _, _)) => mode,
                     None => return Ok(None),
                 };
                 return Ok(Some((ino, comp.to_string(), mode, parent)));
@@ -2593,7 +2687,7 @@ impl CairnEngine {
                 // Parent is the root directory: its entry hash (empty name) is
                 // the tree root itself anchored by the stored snapshot root.
                 let p_mode = match db.get_inode(parent)? {
-                    Some((mode, _, _, _, _, _, _)) => mode,
+                    Some((mode, _, _, _, _, _, _, _)) => mode,
                     None => anyhow::bail!("parent inode missing"),
                 };
                 let root_leaf = Self::snapshot_leaf(2, p_mode, "", children_root);
@@ -2605,7 +2699,7 @@ impl CairnEngine {
 
             // Otherwise climb: the parent's own node hash enters its parent.
             let (p_name, p_mode) = match db.get_inode(parent)? {
-                Some((mode, _, _, _, _, _, _)) => (db.get_inode_name(parent)?, mode),
+                Some((mode, _, _, _, _, _, _, _)) => (db.get_inode_name(parent)?, mode),
                 None => anyhow::bail!("parent inode missing"),
             };
             cur_hash = Self::snapshot_leaf(2, p_mode, &p_name, children_root);
@@ -2692,7 +2786,7 @@ impl CairnEngine {
             .await
             .map_err(CairnEngine::to_eio)?
             {
-                Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec))) => {
+                Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, _rdev))) => {
                     let mtime_sec_u64 = u64::try_from(mtime_sec).unwrap_or(0);
                     let attr =
                         mk_file_attr(ino, mode, uid, gid, size, nlink, mtime_sec_u64, mtime_nsec);
@@ -2734,11 +2828,12 @@ impl CairnEngine {
         .await
         .map_err(CairnEngine::to_eio)?
         {
-            Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec))) => {
+            Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, rdev))) => {
                 let mtime_sec_u64 = u64::try_from(mtime_sec)
                     .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-                let attr =
+                let mut attr =
                     mk_file_attr(ino, mode, uid, gid, size, nlink, mtime_sec_u64, mtime_nsec);
+                attr.rdev = rdev as u32;
                 self.meta_cache.insert(ino, (attr.clone(), now));
                 Ok(attr)
             }
@@ -3100,14 +3195,14 @@ impl CairnEngine {
             state.data.extend_from_slice(data);
             state.buffered_bytes += data.len();
             self.global_write_buffer_bytes
-                .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(data.len(), std::sync::atomic::Ordering::AcqRel);
             state.advance_digest(offset, data)?;
         } else if offset == seq_end {
             // Sequential append
             state.data.extend_from_slice(data);
             state.buffered_bytes += data.len();
             self.global_write_buffer_bytes
-                .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(data.len(), std::sync::atomic::Ordering::AcqRel);
             state.advance_digest(offset, data)?;
         } else {
             // Random write: flush the existing buffer, then restart it at the new offset.
@@ -3127,7 +3222,7 @@ impl CairnEngine {
             state.data.extend_from_slice(data);
             state.buffered_bytes += data.len();
             self.global_write_buffer_bytes
-                .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(data.len(), std::sync::atomic::Ordering::AcqRel);
             // Non-contiguous write: the incremental digest no longer describes
             // the file. Callers with the private key recompute it from storage.
             state.digest = None;
@@ -3269,7 +3364,7 @@ impl CairnEngine {
         let mut entries = Vec::new();
 
         if offset == 0 {
-            if let Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec))) =
+            if let Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, _rdev))) =
                 tokio::task::spawn_blocking({
                     let db = self.db.clone();
                     let i = parent;
@@ -3308,7 +3403,7 @@ impl CairnEngine {
             .await
             .map_err(CairnEngine::to_eio)?
             .unwrap_or(1);
-            if let Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec))) =
+            if let Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, _rdev))) =
                 tokio::task::spawn_blocking({
                     let db = self.db.clone();
                     let i = parent_parent;
@@ -3452,7 +3547,7 @@ impl CairnEngine {
                         ));
                     }
                 }
-                db.insert_inode_with_dentry(m, u, g, 4096, 2, p, &n, enc.as_deref())
+                db.insert_inode_with_dentry(m, u, g, 4096, 2, 0, p, &n, enc.as_deref())
                     .map_err(CairnEngine::to_eio)
             }
         })
@@ -3492,7 +3587,7 @@ impl CairnEngine {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _rdev: u32,
+        rdev: u32,
     ) -> std::io::Result<EngineReplyEntry> {
         self.meta_cache.remove(&parent);
         tracing::trace!(
@@ -3514,10 +3609,11 @@ impl CairnEngine {
             let m = mode;
             let u = req.uid;
             let g = req.gid;
+            let r = rdev as u64;
             let p = parent;
             let n = name_key;
             let enc = name_enc;
-            move || db.insert_inode_with_dentry(m, u, g, 0, 1, p, &n, enc.as_deref())
+            move || db.insert_inode_with_dentry(m, u, g, 0, 1, r, p, &n, enc.as_deref())
         })
         .await
         .map_err(CairnEngine::to_eio)?
@@ -3602,8 +3698,8 @@ impl CairnEngine {
                     .ok()
                     .map(|(k, _)| k)
                     .unwrap_or_default();
-                let _ = tokio::task::spawn_blocking(move || db.atomic_unlink(parent, &n, false))
-                    .await;
+                let _ =
+                    tokio::task::spawn_blocking(move || db.atomic_unlink(parent, &n, false)).await;
                 Err(e)
             }
         }
@@ -3626,12 +3722,11 @@ impl CairnEngine {
         .await
         .map_err(CairnEngine::to_eio)?;
         match dentry_result {
-            Ok(Some(_ino)) => {
+            Ok(Some(ino)) => {
+                // Drain any pending write buffer for this inode before deleting
+                // it, so buffered bytes aren't silently lost (audit O2 #2).
+                let _ = self.flush_pending_buffer(ino).await;
                 // propagate the unlink result instead of `let _ =`.
-                // A real DB error now returns EIO; a successful unlink still
-                // returns Ok(()). The `ino` binding is for symmetry with the
-                // no-foreign-keys design; we don't link it to in-memory state
-                // because the write_buffers entry is flushed lazily on release.
                 let res = tokio::task::spawn_blocking({
                     let db = self.db.clone();
                     let p = parent;
@@ -3834,7 +3929,7 @@ impl CairnEngine {
             let p = parent;
             let n = name_key;
             let enc = name_enc;
-            move || db.insert_inode_with_dentry(mode, u, g, s, 1, p, &n, enc.as_deref())
+            move || db.insert_inode_with_dentry(mode, u, g, s, 1, 0, p, &n, enc.as_deref())
         })
         .await
         .map_err(CairnEngine::to_eio)?
@@ -4118,7 +4213,9 @@ impl CairnEngine {
         // take effect — previously setattr dropped set_attr.mtime on the floor,
         // so the kernel's cached attr stayed stale (Haiku audit #7).
         if let Some(mtime) = set_attr.mtime {
-            let dur = mtime.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let dur = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
             let sec = dur.as_secs() as i64;
             let nsec = dur.subsec_nanos();
             let db = self.db.clone();
@@ -4160,17 +4257,19 @@ impl CairnEngine {
         .await
         .map_err(CairnEngine::to_eio)?
         {
-            Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec))) => Ok(mk_file_attr(
-                ino,
-                mode,
-                uid,
-                gid,
-                size,
-                nlink,
-                // saturate negative mtime_sec.
-                u64::try_from(mtime_sec).unwrap_or(0),
-                mtime_nsec,
-            )),
+            Ok(Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, _rdev))) => {
+                Ok(mk_file_attr(
+                    ino,
+                    mode,
+                    uid,
+                    gid,
+                    size,
+                    nlink,
+                    // saturate negative mtime_sec.
+                    u64::try_from(mtime_sec).unwrap_or(0),
+                    mtime_nsec,
+                ))
+            }
             Ok(None) => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
             Err(e) => {
                 tracing::error!("setattr: read-back get_inode({ino}) failed after update: {e}");
@@ -4898,7 +4997,7 @@ impl CairnEngine {
             move || db.get_inode(i)
         })
         .await;
-        if let Ok(Ok(Some((mode, uid, gid, _size, _nlink, mtime_sec, mtime_nsec)))) = attr {
+        if let Ok(Ok(Some((mode, uid, gid, _size, _nlink, mtime_sec, mtime_nsec, _rdev)))) = attr {
             // keep setuid/setgid/sticky bits (0o7777,
             // not 0o777). mtime/ctime are set to the SAME value because the
             // archive stores only mtime; atime is not stored (would need a
@@ -4916,7 +5015,7 @@ impl CairnEngine {
             // chmod follows symlinks and Linux ignores a symlink's own permission
             // bits, so skip it for links rather than rewriting the target's mode.
             if !is_symlink {
-                let perm = std::fs::Permissions::from_mode(mode & 0o1777);
+                let perm = std::fs::Permissions::from_mode(mode & 0o7777);
                 if let Err(e) = tokio::fs::set_permissions(path, perm).await {
                     tracing::warn!("preserve: chmod {:?}: {e}", path);
                 }
@@ -5076,7 +5175,7 @@ impl CairnEngine {
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
-                    let (mode, _uid, _gid, _size, nlink, _mtime_sec, _mtime_nsec) =
+                    let (mode, _uid, _gid, _size, nlink, _mtime_sec, _mtime_nsec, rdev) =
                         match inode_result {
                             Ok(Some(info)) => info,
                             Ok(None) => {
@@ -5095,14 +5194,7 @@ impl CairnEngine {
                             }
                         };
                     {
-                        let name_path = std::path::Path::new(&name);
-                        if name_path.is_absolute()
-                            || name_path.components().any(|c| {
-                                matches!(c, std::path::Component::ParentDir)
-                                    || matches!(c, std::path::Component::CurDir)
-                            })
-                            || name.contains('/')
-                        {
+                        if !is_dentry_name_safe(&name) {
                             // An unsafe dentry name is a tampering/integrity
                             // signal (backup never writes such names). Silently
                             // omitting it used to let a restore exit 0 while
@@ -5148,9 +5240,14 @@ impl CairnEngine {
                                             .components()
                                             .any(|c| matches!(c, std::path::Component::ParentDir));
                                     if unsafe_target {
+                                        // Counted failure, not warn-and-continue:
+                                        // a restore that drops links must exit
+                                        // non-zero (loud-counted policy).
+                                        failures += 1;
                                         tracing::warn!(
                                             "extract: refusing symlink with unsafe target \
-                                             {target_str:?} (absolute or contains '..')"
+                                             {target_str:?} (absolute or contains '..') — \
+                                             counted as a failure"
                                         );
                                     } else {
                                         if let Err(e) =
@@ -5166,7 +5263,7 @@ impl CairnEngine {
                                 Ok(None) => {}
                                 Err(e) => {
                                     failures += 1;
-                                        tracing::error!(
+                                    tracing::error!(
                                         "extract: symlink {path:?} could NOT be restored: {e}"
                                     );
                                     continue;
@@ -5182,15 +5279,29 @@ impl CairnEngine {
                             let fmt = mode & libc::S_IFMT;
                             fmt != 0 && fmt != libc::S_IFREG
                         } {
-                            // Special files (FIFO/CHR/BLK/SOCK) are not regular
-                            // files; extract_matching skips them with a warning.
-                            // Mirror that here so extract_all doesn't materialise
-                            // them as empty regular files.
-                            failures += 1;
-                            tracing::warn!(
-                                "extract: skipping special file at {path:?} (not a regular file)"
-                            );
-                            continue;
+                            // Special files (FIFO/CHR/BLK) are recreated via
+                            // mknod(2) with the stored rdev; SOCK cannot be
+                            // created with mknod(2) and is still skipped.
+                            // Unprivileged restores surface a counted failure
+                            // instead of silently skipping (audit 2026-11-17).
+                            let fmt2 = mode & libc::S_IFMT;
+                            if fmt2 == libc::S_IFSOCK {
+                                failures += 1;
+                                tracing::warn!(
+                                    "extract: skipping special file at {path:?} (SOCK cannot be recreated)"
+                                );
+                                continue;
+                            }
+                            let rdev_full = rdev as u64;
+                            if let Err(e) = recreate_special_file(mode, rdev_full, &path) {
+                                failures += 1;
+                                tracing::warn!(
+                                    "extract: mknod {path:?} (mode {mode:#o}, rdev {rdev_full}) failed: {e}"
+                                );
+                                continue;
+                            }
+                            // unix success path: mknod succeeded; fall through
+                            // to the end of the loop body (next entry).
                         } else {
                             // Hardlink recreation: if this archive inode (nlink>1)
                             // was already extracted under another name, link the new
@@ -5330,6 +5441,14 @@ impl CairnEngine {
         let compiled_pattern = glob::Pattern::new(pattern)?;
         tokio::fs::create_dir_all(dest_dir).await?;
 
+        // Per-file failure counter (aligned with extract_all): entries that
+        // are skipped or refused are counted, and the extract ends non-zero.
+        let mut failures: u64 = 0;
+        // Glob predicate shared by every entry branch (a vpath matches with
+        // or without its leading '/').
+        let pattern_hit = |vp: &str| {
+            compiled_pattern.matches(vp) || compiled_pattern.matches(vp.trim_start_matches('/'))
+        };
         let mut stack = vec![(1u64, String::new())];
         // Hardlink recreation (same as extract_all): archive inode (nlink>1) →
         // first extracted disk path. Only names that match the glob are linked;
@@ -5338,9 +5457,10 @@ impl CairnEngine {
             std::collections::HashMap::new();
 
         while let Some((parent_ino, current_vpath)) = stack.pop() {
-            // a DB error listing a directory must fail the extract
-            // loudly rather than silently omitting that subtree. extract_matching
-            // has no per-file failure counter, so propagate the error (non-zero exit).
+            // A DB error while listing a directory must fail the extract
+            // loudly rather than silently omitting that subtree: unlike the
+            // per-entry skips below, this is propagated (non-zero exit)
+            // rather than counted.
             let dentries_result = tokio::task::spawn_blocking({
                 let db = self.db.clone();
                 let i = parent_ino;
@@ -5367,13 +5487,14 @@ impl CairnEngine {
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?;
-                    let (mode, _uid, _gid, _size, nlink, _mtime_sec, _mtime_nsec) =
+                    let (mode, _uid, _gid, _size, nlink, _mtime_sec, _mtime_nsec, rdev) =
                         match inode_result {
                             Ok(Some(info)) => info,
                             Ok(None) => {
                                 tracing::error!(
                                     "extract: inode {ino} (name {name:?}) not found in DB — skipped"
                                 );
+                                failures += 1;
                                 continue;
                             }
                             Err(e) => {
@@ -5383,21 +5504,18 @@ impl CairnEngine {
                             }
                         };
                     {
-                        let name_path = std::path::Path::new(&name);
-                        if name_path.is_absolute()
-                            || name_path.components().any(|c| {
-                                matches!(c, std::path::Component::ParentDir)
-                                    || matches!(c, std::path::Component::CurDir)
-                            })
-                            || name.contains('/')
-                        {
-                            // extract_matching has no per-file failure counter;
-                            // consistent with its other skips, fail loudly
-                            // rather than silently omitting the entry.
-                            return Err(anyhow::anyhow!(
+                        if !is_dentry_name_safe(&name) {
+                            // Same policy as extract_all: an unsafe dentry name
+                            // is a tampering/integrity signal (backup never
+                            // writes such names). Refuse the entry and COUNT it
+                            // as a failure (non-zero exit) while leaving the
+                            // rest of the restore alone.
+                            failures += 1;
+                            tracing::error!(
                                 "extract: unsafe dentry name {name:?} (absolute, parent/current \
-                                 component or contains '/')"
-                            ));
+                                 component or contains '/') — skipped, counted as a failure"
+                            );
+                            continue;
                         }
 
                         let new_vpath = if current_vpath.is_empty() {
@@ -5408,12 +5526,33 @@ impl CairnEngine {
 
                         let ifmt = mode & libc::S_IFMT;
                         if ifmt == libc::S_IFDIR {
+                            // A directory the glob selects is materialized (even
+                            // empty) and its metadata preserved; unmatched dirs
+                            // are only traversed — matching children create
+                            // their own parents.
+                            if pattern_hit(&new_vpath) {
+                                let dir_path = std::path::Path::new(dest_dir)
+                                    .join(new_vpath.trim_start_matches('/'));
+                                tokio::fs::create_dir_all(&dir_path).await?;
+                                if preserve_metadata {
+                                    #[cfg(unix)]
+                                    {
+                                        self.apply_preserved_metadata(ino, &dir_path).await;
+                                    }
+                                }
+                            }
                             stack.push((ino, new_vpath));
                         } else if ifmt == libc::S_IFLNK {
                             // `extract_all` already restores
                             // symlinks; `extract_matching` used to drop them
                             // silently. A glob over a directory tree with
                             // symlinks now extracts the symlinks.
+                            if !pattern_hit(&new_vpath) {
+                                // Glob filter: an unmatched link is simply not
+                                // part of this extraction — silent skip, never
+                                // counted as a failure.
+                                continue;
+                            }
                             let relative_path = new_vpath.trim_start_matches('/');
                             let dest_link_path = std::path::Path::new(dest_dir).join(relative_path);
                             if let Some(parent) = dest_link_path.parent() {
@@ -5438,6 +5577,7 @@ impl CairnEngine {
                                     tracing::warn!(
                                         "extract: skipping {relative_path} (symlink in destination path)"
                                     );
+                                    failures += 1;
                                     continue;
                                 }
                                 tokio::fs::create_dir_all(parent).await?;
@@ -5453,10 +5593,14 @@ impl CairnEngine {
                                                 matches!(c, std::path::Component::ParentDir)
                                             });
                                         if unsafe_target {
+                                            // Counted failure, not warn-and-continue:
+                                            // a refused entry must make the restore exit
+                                            // non-zero (same policy as extract_all).
                                             tracing::warn!(
                                                 "extract: refusing symlink with unsafe target \
                                                  {target_str:?} (absolute or contains '..')"
                                             );
+                                            failures += 1;
                                         } else if let Err(e) =
                                             tokio::fs::symlink(target_str.as_ref(), &dest_link_path)
                                                 .await
@@ -5465,6 +5609,7 @@ impl CairnEngine {
                                                 "extract: symlink {dest_link_path:?} -> \
                                                  {target_str}: {e}"
                                             );
+                                            failures += 1;
                                         }
                                     }
                                 }
@@ -5473,6 +5618,7 @@ impl CairnEngine {
                                     tracing::warn!(
                                         "extract: symlink {dest_link_path:?} unreadable: {e}"
                                     );
+                                    failures += 1;
                                 }
                             }
                             if preserve_metadata {
@@ -5481,10 +5627,7 @@ impl CairnEngine {
                                     self.apply_preserved_metadata(ino, &dest_link_path).await;
                                 }
                             }
-                        } else if ifmt == libc::S_IFREG
-                            && (compiled_pattern.matches(&new_vpath)
-                                || compiled_pattern.matches(new_vpath.trim_start_matches('/')))
-                        {
+                        } else if ifmt == libc::S_IFREG && pattern_hit(&new_vpath) {
                             let relative_path = new_vpath.trim_start_matches('/');
                             // Refuse to traverse a pre-existing symlink in the destination:
                             // create_dir_all would follow it and write outside dest_dir.
@@ -5507,6 +5650,7 @@ impl CairnEngine {
                                 tracing::warn!(
                                     "extract: skipping {relative_path} (symlink in destination path)"
                                 );
+                                failures += 1;
                                 continue;
                             }
 
@@ -5532,7 +5676,16 @@ impl CairnEngine {
                             }
 
                             if !linked {
-                                self.extract_file_to(ino, &dest_file_path).await?;
+                                if let Err(e) = self.extract_file_to(ino, &dest_file_path).await {
+                                    // Counted failure, not abort (aligned with
+                                    // extract_all): one lost chunk must not
+                                    // strand every other matched file.
+                                    failures += 1;
+                                    tracing::error!(
+                                        "extract: {relative_path} could NOT be restored: {e}"
+                                    );
+                                    continue;
+                                }
 
                                 #[cfg(unix)]
                                 {
@@ -5562,16 +5715,52 @@ impl CairnEngine {
                             ifmt,
                             libc::S_IFIFO | libc::S_IFCHR | libc::S_IFBLK | libc::S_IFSOCK
                         ) {
-                            tracing::warn!(
-                                "extract: skipping special file at {new_vpath} \
-                                 (FIFO/CHR/BLK/SOCK cannot be reliably restored)"
-                            );
+                            // Glob filter: an unmatched special is not part of
+                            // this extraction — silent skip. (Without the filter
+                            // a single un-restorable special ANYWHERE in the
+                            // tree made every narrow glob exit non-zero.)
+                            if !pattern_hit(&new_vpath) {
+                                continue;
+                            }
+                            // FIFO/CHR/BLK are recreated via mknod(2) with the
+                            // stored rdev; SOCK cannot be created with mknod(2)
+                            // and is still skipped (audit 2026-11-17 fix).
+                            if ifmt == libc::S_IFSOCK {
+                                tracing::warn!(
+                                    "extract: skipping special file at {new_vpath} \
+                                     (SOCK cannot be recreated)"
+                                );
+                                failures += 1;
+                                continue;
+                            }
+                            let dest_special = std::path::Path::new(dest_dir)
+                                .join(new_vpath.trim_start_matches('/'));
+                            if let Some(parent) = dest_special.parent() {
+                                // The glob may have skipped every regular under
+                                // this directory — mknod needs the parent to
+                                // exist.
+                                tokio::fs::create_dir_all(parent).await?;
+                            }
+                            if let Err(e) = recreate_special_file(mode, rdev as u64, &dest_special)
+                            {
+                                tracing::warn!(
+                                    "extract: mknod {new_vpath} (mode {mode:#o}, rdev {rdev}) failed: {e}"
+                                );
+                                failures += 1;
+                                continue;
+                            }
                         }
                     }
                 }
             }
         }
 
+        if failures > 0 {
+            anyhow::bail!(
+                "{failures} file(s) could NOT be restored (see the errors above); \
+                 all other files were extracted"
+            );
+        }
         Ok(())
     }
 
@@ -5940,23 +6129,47 @@ impl CairnEngine {
             // Re-check: a concurrent flush may have re-referenced this
             // chunk since `orphaned` was computed (dedup hit on an old
             // orphaned object). Deleting it now would brick that file (EIO).
-            if !db.get_inodes_using_chunk(&hash_key).unwrap_or_default().is_empty() {
-                tracing::debug!(
-                    "gc: {hash_key} re-referenced since orphan scan — skipping"
-                );
-                drop(_permit);
-                continue;
+            // A DB error here means we cannot prove safety — skip deletion
+            // (fail safe) rather than assume the chunk is unreferenced.
+            match db.get_inodes_using_chunk(&hash_key) {
+                Ok(refs) if refs.is_empty() => {}
+                Ok(_) => {
+                    tracing::debug!("gc: {hash_key} re-referenced since orphan scan — skipping");
+                    drop(_permit);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "gc: cannot verify references for {hash_key}: {e} — skipping (fail safe)"
+                    );
+                    drop(_permit);
+                    continue;
+                }
             }
-            // Remove the index row FIRST.
-            // orphaned blob (row gone, delete below fails) merely leaks storage
-            // and the local sweep reclaims it, while a dangling row (data gone,
-            // row removal fails) turns into EIO at read time.
-            if let Err(e) = db.remove_chunk_from_index(&hash_key) {
-                tracing::error!(
-                    "gc: failed to remove {hash_key} from index: {e} — leaving its data in place"
-                );
-                drop(_permit);
-                continue;
+            // Remove the index row FIRST (before the blob/cloud deletes):
+            // an orphaned blob (row gone, delete below fails) merely leaks
+            // storage and the local sweep reclaims it, while a dangling row
+            // (data gone, row removal fails) turns into EIO at read time.
+            // Re-check ATOMICALLY: refs are verified and the row deleted in
+            // one transaction, so a dedup-hit flush landing between
+            // the old two-step check and delete can no longer leave a
+            // dangling file_chunks reference.
+            match db.remove_chunk_from_index_if_unreferenced(&hash_key) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        "gc: {hash_key} re-referenced before the delete transaction — skipping"
+                    );
+                    drop(_permit);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "gc: failed to remove {hash_key} from index: {e} — leaving its data in place"
+                    );
+                    drop(_permit);
+                    continue;
+                }
             }
             let _ = cacache::remove(&cache_dir, &hash_key).await;
             #[cfg(feature = "cloud-storage")]
@@ -5988,11 +6201,42 @@ impl CairnEngine {
         let mut local_orphans = 0;
         let mut protected = self.db.get_all_used_chunks()?;
         protected.extend(self.db.get_all_indexed_chunk_objects()?);
+        // An async-mode chunk is enqueued for upload BEFORE its
+        // chunk_index rows are committed (batch insert happens after the
+        // chunker returns). Its local blob is the only copy until the
+        // background worker uploads it — and the worker reads it back from
+        // this very cache — so upload_queue entries must pin the sweep too,
+        // exactly like the global sweep already does in get_orphaned_chunks.
+        protected.extend(self.db.get_upload_queue()?);
         for entry in cacache::list_sync(&self.cache_dir).flatten() {
-            if !protected.contains(&entry.key) {
-                let _ = cacache::remove(&self.cache_dir, &entry.key).await;
-                local_orphans += 1;
+            if protected.contains(&entry.key) {
+                continue;
             }
+            // Re-check: a flush may have committed this blob (and its
+            // chunk_index row) between the snapshot above and now. Deleting
+            // it would brick the in-flight file (EIO) and defeat the retry.
+            // The entry may also have just been ENQUEUED for upload
+            // (queued but not yet indexed) — deleting the blob then strands
+            // the queue entry forever and permanently loses the cloud copy.
+            // A DB error here cannot prove safety — skip (fail safe).
+            if self
+                .db
+                .get_all_indexed_chunk_objects()
+                .map(|s| s.contains(&entry.key))
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if self
+                .db
+                .get_upload_queue()
+                .map(|q| q.contains(&entry.key))
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let _ = cacache::remove(&self.cache_dir, &entry.key).await;
+            local_orphans += 1;
         }
 
         tracing::info!(
@@ -6329,9 +6573,7 @@ impl CairnEngine {
                             .db
                             .get_inode_name(ino)
                             .unwrap_or_else(|_| format!("ino {ino}"));
-                        tracing::error!(
-                            "Corrupted inline data detected: ino {ino} ({name})"
-                        );
+                        tracing::error!("Corrupted inline data detected: ino {ino} ({name})");
                         corrupted += 1;
                     } else {
                         verified += 1;

@@ -47,3 +47,36 @@ A desktop/web front-end that acts as an orchestrator/wrapper around the `cairn` 
 ## Cross-platform Mounting (Windows / macOS)
 - **Adapter approach**: Support filesystem mounting on non-Linux systems using the `fuser` crate (which binds to WinFSP on Windows and macFUSE on macOS).
 - **Architecture**: Create `cairn-fuser-cross`, a synchronous adapter that wraps `cairn-core` calls in `block_on`. Windows users will select a mountpoint (e.g. `Z:\` or `X:\` via CLI argument) and rely on WinFSP. Linux users will continue to use the high-performance async `fuse3` adapter.
+
+## Shared-dedup domain store: general GC
+~~No reclaim path~~ — **IMPLEMENTED 2026-11-18** (holder-refcount GC, `cairn shared-gc`).
+The race-loser leak is fixed (a publisher that loses the content race deletes
+its own object), and domain stores now reclaim via holder links.
+
+**DECISION (2026-11-18): cross-client holder refcount.** Design and shipped shape:
+- Each archive gets a random `dedup_holder_id` at init (stored in the archive
+  config; stable across moves). Publishing, adopting, or backup-reusing a
+  domain chunk (re)creates `dedup/shared/<ns>/holders/<content_id>/<holder_id>`
+  (`create_new`, idempotent; empty file).
+- `destroy` (and `snapshot rm/prune` for content no remaining snapshot needs)
+  best-effort deletes its holder links by scanning its own domain-flagged
+  `chunk_index` rows.
+- New operator command `cairn shared-gc`: for each record, enumerate holders;
+  reclaim = two-phase — rename the record aside, re-enumerate (a holder that
+  appeared in between aborts and restores the record), then delete record +
+  object. Re-check mirrors the gc-conditional-delete pattern already used for
+  the archive index.
+- Orphan holders (archive lost without `destroy`): links are touched on every
+  backup; `shared-gc --reclaim-stale-holders N` (default N=90 days, explicit
+  operator flag only) drops links untouched for N days.
+- Safety gate: a `holders/ENABLED` marker in the domain store, written by the
+  first refcount-aware archive; shared-gc refuses stores without it, so
+  pre-refcount content is never mass-reclaimed.
+- Privacy: holder ids are random per-archive; links reveal only "some member
+  holds content X" inside an already-trusted domain.
+Shipped with regression tests (holder idempotency, marker gate, held/unheld
+reclaim, dry-run, stale-holder drop) and an E2E stand check (holder files
+appear after domain backups; `shared-gc --dry-run` reports nothing reclaimable
+while a member holds). Follow-up candidates: release links on `snapshot rm`
+(currently links persist — conservative and safe) and a `destroy` flow that
+releases an archive's links explicitly.

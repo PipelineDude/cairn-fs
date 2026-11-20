@@ -42,7 +42,19 @@ have their sealed key records wrapped under a key derived from the domain secret
 with the corresponding records and ciphertext can decrypt those chunks **without an archive's private key**.
 The writing host must have the domain secret; therefore it is not write-only for domain chunks, including chunks
 published by other archives in the same domain. Inline data and hidden names retain their archive envelopes.
-Keep untrusted write-only hosts in archive-local mode (omit the shared-domain options).
+Domain records (the per-content metadata mapping) are themselves encrypted at rest under a key derived from
+the domain secret, so read access to the domain store without the secret reveals nothing beyond access
+patterns. Holder links (`holders/<content_id>/<holder-id>`, empty files) expose *within the already-trusted
+domain* that some member references a content id; holder ids are random per-archive and reveal no identity
+outside the domain. Keep untrusted write-only hosts in archive-local mode (omit the shared-domain options).
+Every archive prints its holder id in `cairn <archive> status` ("GC holder id"); an archive that is destroyed
+without a flow leaves its pins behind. They can be released surgically with
+`cairn <archive> shared-gc --drop-holder <id> [--dry-run]` when the id was recorded before the archive
+disappeared — safer than the age-based `--reclaim-stale-holders-days`, which cannot tell a destroyed archive
+from a live-but-idle one. Otherwise pins are released only by that age-based sweep, and the holder id cannot
+be discovered for a destroyed archive, so record it before destroying.
+Prefer `cairn <archive> destroy-shared --i-accept-destroy` (drops all pins immediately) before deleting
+the database, and `cairn <archive> heartbeat` (via cron) for live archives so they never look stale.
 
 ### Backend credentials and legacy configuration
 Backend URIs are metadata protected by SQLCipher, not by the content recipient. A password-holding backup host

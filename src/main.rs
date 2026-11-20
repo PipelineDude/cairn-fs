@@ -50,6 +50,95 @@ fn decrypt_config_value(crypto: &cairn_seal::CryptoCtx, value: &str) -> Result<S
     }
 }
 
+/// Drop a SQLite DB file plus its `-wal`/`-shm` sidecars (best-effort).
+fn remove_db_files(path: &str, remove_main: bool) {
+    if remove_main {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let _ = std::fs::remove_file(format!("{path}-shm"));
+}
+
+/// Build the JSON snapshot stats shared by `status` and `snapshot ls`.
+fn snapshot_stats(db: &cairn_index::Db, snapshots: Vec<(u64, String, u64)>) -> Vec<SnapshotStat> {
+    snapshots
+        .into_iter()
+        .map(|(id, name, timestamp)| SnapshotStat {
+            id,
+            name,
+            timestamp,
+            protected: db.snapshot_control(id).map(|v| v.0).unwrap_or(false),
+            tags: db
+                .snapshot_control(id)
+                .ok()
+                .and_then(|v| serde_json::from_str(&v.1).ok())
+                .unwrap_or(serde_json::Value::Array(vec![])),
+        })
+        .collect()
+}
+
+/// Shared snapshot-list rendering for `status` and `snapshot ls`.
+fn print_snapshot_list(with_blank_line: bool, snapshots: &[(u64, String, u64)]) {
+    if with_blank_line {
+        println!();
+    }
+    println!("--- Snapshots ---");
+    println!("  Total snapshots:      {}", snapshots.len());
+    for (id, name, ts) in snapshots {
+        println!("    #{id} {name} (unix={ts})");
+    }
+}
+
+/// Log a finished GC pass to `<archive>.log` (OPERATING §7 health signal).
+fn log_gc_finished(
+    archive_path: &str,
+    duration_ms: u128,
+    total_removed: usize,
+    local_orphans: usize,
+) {
+    append_log(
+        archive_path,
+        LogEvent::GcFinished {
+            duration_ms,
+            total_removed,
+            local_orphans,
+            timestamp: unix_ts(),
+        },
+    );
+}
+
+/// Best-effort fsync of a just-written file (durability of the recovery copy).
+fn fsync_file(path: &std::path::Path) {
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.sync_all();
+    }
+}
+
+/// Best-effort fsync of a directory (durability of rename/create inside it).
+fn fsync_dir(dir: &std::path::Path) {
+    if let Ok(dir) = std::fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+}
+
+/// Unix-seconds "now", saturating on clock error (same semantics as all
+/// existing call sites: `unwrap_or_default` → 0).
+fn unix_ts() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Gate a destructive command on the archive's key-model block (append-only
+/// or missing master key). `ctx` names the operation for the refusal message.
+fn destroy_gate(destroy_block: Option<&str>, ctx: &str) -> Result<()> {
+    if let Some(reason) = destroy_block {
+        anyhow::bail!("Refused: {reason} ({ctx}).");
+    }
+    Ok(())
+}
+
 fn validate_backend_uri(uri: &str) -> Result<()> {
     let url = url::Url::parse(uri).map_err(|_| anyhow::anyhow!("invalid backend URI"))?;
     if !matches!(url.scheme(), "s3" | "gcs" | "azblob" | "fs") {
@@ -463,10 +552,7 @@ fn copy_index_backup(
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("archive.db");
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let ts = unix_ts();
             prune_target = Some((p.to_path_buf(), base.to_string()));
             p.join(format!("{base}.indexbak.{ts}"))
         } else {
@@ -497,13 +583,9 @@ fn copy_index_backup(
         let _ = std::fs::set_permissions(&dest_path, std::fs::Permissions::from_mode(0o600));
     }
     // Best-effort durability of the recovery copy.
-    if let Ok(f) = std::fs::File::open(&dest_path) {
-        let _ = f.sync_all();
-    }
+    fsync_file(&dest_path);
     if let Some(parent) = dest_path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        fsync_dir(parent);
     }
 
     // Rotation: for a directory destination, keep only the newest `keep` timestamped
@@ -515,10 +597,7 @@ fn copy_index_backup(
     }
 
     let dest_s = dest_path.display().to_string();
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let ts = unix_ts();
     let _ = db.set_config("last_index_backup_path", &dest_s);
     let _ = db.set_config("last_index_backup_ts", &ts.to_string());
     Ok(dest_s)
@@ -650,6 +729,12 @@ struct Args {
     /// Directory for local chunk cache
     #[arg(long, global = true)]
     cache_dir: Option<String>,
+
+    /// Escape hatch: reuse a cache directory already owned by ANOTHER archive.
+    /// Dangerous — gc and --cache-limit-mb sweeps are index-scoped, so two
+    /// archives sharing one cache dir delete each other's in-use blobs.
+    #[arg(long, global = true)]
+    allow_shared_cache: bool,
 
     /// File holding the shared-dedup domain secret. Required when opening an
     /// archive configured for shared dedup if its stored path is unavailable.
@@ -885,6 +970,48 @@ enum Commands {
     Gc {
         #[arg(long, default_value_t = 24)]
         grace_period_hours: u64,
+    },
+    /// Reclaim shared-dedup domain records/objects that NO member archive
+    /// holds anymore (holder-link refcount; see OPERATING.md). Requires
+    /// CAIRN_SHARED_DEDUP_SECRET. Safe only on stores with the holders/ENABLED
+    /// marker; refuses legacy stores loudly.
+    SharedGc {
+        /// Report what would be reclaimed without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also drop holder links untouched for N days — for archives that
+        /// were destroyed WITHOUT `destroy`. DANGEROUS for idle-but-live
+        /// archives: an archive that has not backed up in N days looks stale.
+        #[arg(long)]
+        reclaim_stale_holders_days: Option<u64>,
+        /// Drop every holder link named HOLDER_ID (the random per-archive id
+        /// an archive prints in `status`) before reclaiming — targeted
+        /// cleanup for a destroyed archive, safer than the age-based
+        /// --reclaim-stale-holders-days. Honors --dry-run.
+        #[arg(long, value_name = "HOLDER_ID")]
+        drop_holder: Option<String>,
+    },
+    /// Mark this archive as destroyed: drop all its holder links across the
+    /// shared-dedup domain so its chunks become reclaimable immediately.
+    /// Requires CAIRN_SHARED_DEDUP_SECRET and an explicit acknowledgement.
+    /// This does NOT delete the archive database or chunks — only the
+    /// cross-archive pins. Safe only when the archive is truly done backing up.
+    DestroyShared {
+        /// Explicit acknowledgement (the archive is permanently gone from this host).
+        #[arg(long)]
+        i_accept_destroy: bool,
+        /// Report what would be dropped without touching anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Refresh every holder link this archive owns across the shared-dedup
+    /// domain: a live archive runs this (via cron) so its pins never look
+    /// stale. Archives that stop heartbeating become reclaimable after
+    /// `--reclaim-stale-holders-days N`.
+    HeartbeatShared {
+        /// Report counts without touching links.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Verify chunk integrity and optionally auto-heal from redundancy
     Scrub {
@@ -1351,6 +1478,98 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("{}_cache", args.archive));
 
+    // SH-9b: cache-dir ownership marker. The gc local sweep and the
+    // --cache-limit-mb sweeper compute their protected set from ONE archive's
+    // index, so two archives sharing one cache dir delete each other's in-use
+    // blobs (silent data loss). Record the owning archive here and refuse the
+    // second one loudly; `--allow-shared-cache` is the documented override.
+    {
+        std::fs::create_dir_all(&cache_dir_base)
+            .map_err(|e| anyhow::anyhow!("cannot create cache dir {cache_dir_base}: {e}"))?;
+        let marker = std::path::Path::new(&cache_dir_base).join(".cairn-cache-owner");
+        let abs = std::path::absolute(&args.archive)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&args.archive));
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let owner = format!(
+            "{name}|{}",
+            blake3::hash(abs.to_string_lossy().as_bytes()).to_hex()
+        );
+        match std::fs::read_to_string(&marker) {
+            Ok(prev) if prev.trim() != owner => {
+                let prev_name = prev.trim().split('|').next().unwrap_or("").to_string();
+                if prev_name == name {
+                    // Same-named archive at a new path: a moved/copied archive
+                    // legitimately inherits its cache dir. Loud warning only —
+                    // the marker is NOT rewritten, so every owner in the mix
+                    // keeps seeing the warning (a basename collision between
+                    // two genuinely different archives looks identical here
+                    // and is why the warning must not be silently dismissible).
+                    tracing::warn!(
+                        "cache dir {cache_dir_base} was created for {prev} — continuing as \
+                         {owner} (same archive name; if this is really a DIFFERENT archive, \
+                         separate the --cache-dirs: gc/sweeps are index-scoped)"
+                    );
+                } else if args.allow_shared_cache {
+                    tracing::warn!(
+                        "--allow-shared-cache: cache dir {cache_dir_base} is also used by \
+                         archive {} — gc/sweeps could delete chunks the other archive needs",
+                        prev.trim()
+                    );
+                    let _ = std::fs::write(&marker, &owner);
+                } else {
+                    anyhow::bail!(
+                        "cache dir {cache_dir_base} is already owned by another cairn archive \
+                         ({}); cairn sweeps are index-scoped and two archives in one cache dir \
+                         destroy each other's blobs. Give each archive its own --cache-dir \
+                         (OPERATING.md) or pass --allow-shared-cache to override.",
+                        prev.trim()
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Atomic claim (adversarial review 2026-11-18): two simultaneous
+                // `init`s of DIFFERENT archives in one fresh cache dir must not
+                // both write their owner — create_new fails the loser, which
+                // then re-reads and hits the refusal/warning path above.
+                use std::fs::OpenOptions;
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&marker)
+                {
+                    Ok(mut f) => {
+                        use std::io::Write;
+                        f.write_all(owner.as_bytes())
+                            .map_err(|e| anyhow::anyhow!("cannot write cache owner marker: {e}"))?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let prev = std::fs::read_to_string(&marker)
+                            .map_err(|e| anyhow::anyhow!("cannot read cache owner marker: {e}"))?;
+                        if prev.trim() != owner
+                            && prev.trim().split('|').next().unwrap_or("") != name
+                            && !args.allow_shared_cache
+                        {
+                            anyhow::bail!(
+                                "cache dir {cache_dir_base} was claimed concurrently by another \
+                                 cairn archive ({}); use a distinct --cache-dir or pass \
+                                 --allow-shared-cache",
+                                prev.trim()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        anyhow::bail!("cannot write cache owner marker {}: {e}", marker.display())
+                    }
+                }
+            }
+            Err(e) => anyhow::bail!("cannot read cache owner marker {}: {e}", marker.display()),
+        }
+    }
+
     if !matches!(args.command, Commands::Init { .. }) && !std::path::Path::new(db_path).exists() {
         anyhow::bail!("Archive '{db_path}' does not exist. Please run 'init' first.");
     }
@@ -1436,8 +1655,25 @@ async fn main() -> Result<()> {
             if shared_dedup.is_some() && args.shared_dedup_secret_file.is_none() {
                 anyhow::bail!(
                     "--shared-dedup-domain requires --shared-dedup-secret-file: \
-                     the path is retained as an archive-local secret source for later writes"
+                     the secret is validated at init (runtime reads/writes need CAIRN_SHARED_DEDUP_SECRET)"
                 );
+            }
+            // SH-9 config trap: pointing the domain store AT the archive's own
+            // cache dir lets the gc local sweep (and the --cache-limit-mb
+            // sweeper) treat domain objects as cache orphans and delete them
+            // — one archive's GC would brick every other member's reads.
+            if let Some(sd) = &shared_dedup_store_dir {
+                let cache_path = std::path::Path::new(&cache_dir_base);
+                let same = match (sd.canonicalize(), cache_path.canonicalize()) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => sd.as_path() == cache_path,
+                };
+                if same {
+                    anyhow::bail!(
+                        "--shared-dedup-store-dir must not equal the archive cache dir \
+                         ({cache_dir_base}): gc/cache sweeps would delete domain-store objects as orphans"
+                    );
+                }
             }
             // A deliberately low CAIRN_KDF_ITER (< the 50k secure floor) marks a
             // throwaway/test archive — the production password policies below
@@ -1674,7 +1910,21 @@ async fn main() -> Result<()> {
                         .as_ref(),
                 )?;
                 if let Some(path) = &args.shared_dedup_secret_file {
-                    db.set_config("dedup_shared_secret_file", &path.to_string_lossy())?;
+                    // Do NOT store the secret-file path in the (password-protected)
+                    // config — the path is the sole bridge from a password holder
+                    // to the domain secret (audit recommendation). The
+                    // secret is validated at init via the file, but reads/writes
+                    // at runtime must supply it via CAIRN_SHARED_DEDUP_SECRET.
+                    let secret = std::fs::read(path).map_err(|e| {
+                        anyhow::anyhow!(
+                            "cannot read --shared-dedup-secret-file {}: {e}",
+                            path.display()
+                        )
+                    })?;
+                    if secret.is_empty() {
+                        anyhow::bail!("shared-dedup secret file {} is empty", path.display());
+                    }
+                    let _ = secret; // validated above; never persisted
                 }
             }
             if *append_only {
@@ -2536,6 +2786,7 @@ async fn main() -> Result<()> {
     if args.cache_limit_mb > 0 && !engine.operators.is_empty() {
         let cache_limit_bytes = args.cache_limit_mb * 1024 * 1024;
         let cache_dir_enforce = cache_dir_base.clone();
+        let sweeper_db = engine.db.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -2549,14 +2800,61 @@ async fn main() -> Result<()> {
                 })
                 .await
                 .unwrap_or_default();
-                let mut total_size: u64 = entries.iter().map(|e| e.size as u64).sum();
+                let total_size_initial: u64 = entries.iter().map(|e| e.size as u64).sum();
 
-                if total_size > cache_limit_bytes {
+                if total_size_initial > cache_limit_bytes {
+                    // Pin chunks still waiting for their cloud upload: the
+                    // upload worker reads the blob back from THIS cache, so
+                    // evicting a queued blob strands the queue entry forever
+                    // and permanently loses the cloud copy (audit 2026-11-17).
+                    // A failed queue read cannot prove what is safe to evict —
+                    // skip this entire pass (fail safe).
+                    let pinned: std::collections::HashSet<String> = {
+                        let db = sweeper_db.clone();
+                        match tokio::task::spawn_blocking(move || db.get_upload_queue())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))
+                        {
+                            Ok(Ok(q)) => q.into_iter().collect(),
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    "cache sweep: cannot read upload queue ({e}) — skipping this pass"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "cache sweep: upload-queue lookup failed ({e}) — skipping this pass"
+                                );
+                                continue;
+                            }
+                        }
+                    };
                     entries.sort_by_key(|e| e.time);
+                    let mut total_size = total_size_initial;
                     let mut removed = 0;
                     for entry in entries {
                         if total_size <= cache_limit_bytes {
                             break;
+                        }
+                        if pinned.contains(&entry.key) {
+                            continue;
+                        }
+                        // The queue can gain entries AFTER the `pinned` snapshot
+                        // above (adversarial review 2026-11-18): a chunk enqueued
+                        // mid-pass must not be evicted before its upload worker
+                        // reads the blob. Re-check this key against the live
+                        // queue; a DB error cannot prove safety — skip eviction.
+                        let queued = {
+                            let db = sweeper_db.clone();
+                            let key = entry.key.clone();
+                            tokio::task::spawn_blocking(move || db.is_in_upload_queue(&key))
+                                .await
+                                .unwrap_or_else(|_| Ok(true))
+                                .unwrap_or(true)
+                        };
+                        if queued {
+                            continue;
                         }
                         // Retry cache eviction up to 3 times on transient errors
                         // (file busy, permission race) to avoid orphaned chunks.
@@ -2617,19 +2915,11 @@ async fn main() -> Result<()> {
                 let start = Instant::now();
                 match gc_engine.gc(24).await {
                     Ok((total_removed, local_orphans)) => {
-                        let duration = start.elapsed().as_millis();
-                        let ts = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        append_log(
+                        log_gc_finished(
                             &args_archive_clone,
-                            LogEvent::GcFinished {
-                                duration_ms: duration,
-                                total_removed,
-                                local_orphans,
-                                timestamp: ts,
-                            },
+                            start.elapsed().as_millis(),
+                            total_removed,
+                            local_orphans,
                         );
                     }
                     Err(e) => tracing::error!("Background GC failed: {}", e),
@@ -2694,6 +2984,11 @@ async fn main() -> Result<()> {
                 .get_config("dedup_id_scheme")
                 .unwrap_or(None)
                 .unwrap_or_else(|| "unknown (legacy archive)".to_string());
+            // Shared-dedup participation (domain GC): the domain and THIS
+            // archive's holder id — record the id before the archive is gone;
+            // `shared-gc --drop-holder <id>` cleans its pins after a destroy.
+            let shared_domain = db.get_config("dedup_shared_domain").unwrap_or(None);
+            let gc_holder_id = db.get_config("dedup_holder_id").unwrap_or(None);
 
             let mut cache_bytes = 0;
             let cache_path = std::path::Path::new(&cache_dir_base);
@@ -2743,26 +3038,15 @@ async fn main() -> Result<()> {
                     append_only: bool,
                     dedup_scope: String,
                     dedup_id_scheme: String,
+                    shared_domain: Option<String>,
+                    gc_holder_id: Option<String>,
                 }
                 let dedup_ratio = if physical_bytes > 0 {
                     (logical_bytes as f64) / (physical_bytes as f64)
                 } else {
                     0.0
                 };
-                let snaps = snapshots
-                    .into_iter()
-                    .map(|(id, name, timestamp)| SnapshotStat {
-                        id,
-                        name,
-                        timestamp,
-                        protected: db.snapshot_control(id).map(|v| v.0).unwrap_or(false),
-                        tags: db
-                            .snapshot_control(id)
-                            .ok()
-                            .and_then(|v| serde_json::from_str(&v.1).ok())
-                            .unwrap_or(serde_json::Value::Array(vec![])),
-                    })
-                    .collect();
+                let snaps = snapshot_stats(&db, snapshots);
                 let st = StatusJson {
                     archive: args.archive.clone(),
                     logical_bytes,
@@ -2778,6 +3062,8 @@ async fn main() -> Result<()> {
                     append_only,
                     dedup_scope,
                     dedup_id_scheme,
+                    shared_domain,
+                    gc_holder_id,
                 };
                 println!("{}", serde_json::to_string(&st).unwrap_or_default());
                 return Ok(());
@@ -2796,6 +3082,10 @@ async fn main() -> Result<()> {
             println!("  Local cache size:     {cache_bytes} bytes");
             println!("  Dedup scope:          {dedup_scope}");
             println!("  Dedup ID scheme:      {dedup_id_scheme}");
+            if let (Some(dom), Some(hid)) = (&shared_domain, &gc_holder_id) {
+                println!("  Shared-dedup domain:  {dom}");
+                println!("  GC holder id:         {hid}  (cleanup: shared-gc --drop-holder <id>)");
+            }
 
             if physical_bytes > 0 && logical_bytes > 0 {
                 println!(
@@ -2837,11 +3127,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            println!("\n--- Snapshots ---");
-            println!("  Total snapshots:      {}", snapshots.len());
-            for (id, name, ts) in &snapshots {
-                println!("    #{id} {name} (unix={ts})");
-            }
+            print_snapshot_list(true, &snapshots);
 
             println!("\n--- Background Operations ---");
             #[cfg(feature = "cloud-storage")]
@@ -2869,20 +3155,7 @@ async fn main() -> Result<()> {
                 let history = db.snapshot_history()?;
                 let snapshots = history.snapshots;
                 if args.json {
-                    let snaps: Vec<SnapshotStat> = snapshots
-                        .into_iter()
-                        .map(|(id, name, timestamp)| SnapshotStat {
-                            id,
-                            name,
-                            timestamp,
-                            protected: db.snapshot_control(id).map(|v| v.0).unwrap_or(false),
-                            tags: db
-                                .snapshot_control(id)
-                                .ok()
-                                .and_then(|v| serde_json::from_str(&v.1).ok())
-                                .unwrap_or(serde_json::Value::Array(vec![])),
-                        })
-                        .collect();
+                    let snaps: Vec<SnapshotStat> = snapshot_stats(&db, snapshots);
                     println!(
                         "{}",
                         serde_json::to_string(&SnapshotList {
@@ -2893,18 +3166,11 @@ async fn main() -> Result<()> {
                         })?
                     );
                 } else {
-                    println!("--- Snapshots ---");
-                    println!("  Total snapshots:      {}", snapshots.len());
-                    for (id, name, ts) in &snapshots {
-                        println!("    #{id} {name} (unix={ts})");
-                    }
+                    print_snapshot_list(false, &snapshots);
                 }
             }
             SnapshotCommands::Create { name } => {
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let ts = unix_ts();
                 append_log(
                     &args.archive,
                     LogEvent::BackupStarted {
@@ -2915,10 +3181,7 @@ async fn main() -> Result<()> {
                 let start = Instant::now();
                 db.create_snapshot(name)?;
                 let duration = start.elapsed().as_millis();
-                let ts2 = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let ts2 = unix_ts();
                 append_log(
                     &args.archive,
                     LogEvent::BackupFinished {
@@ -2943,9 +3206,7 @@ async fn main() -> Result<()> {
                 }
             }
             SnapshotCommands::Rm { id } => {
-                if let Some(reason) = destroy_block {
-                    anyhow::bail!("Refused: {reason} (snapshot rm deletes history).");
-                }
+                destroy_gate(destroy_block, "snapshot rm deletes history")?;
                 // Consistency with `rollback`: reject a non-existent id instead of
                 // a silent no-op DELETE, so a typo'd id is reported rather than
                 // appearing to succeed.
@@ -2965,9 +3226,7 @@ async fn main() -> Result<()> {
                 // be able to choose which tree the operator sees next (and chain
                 // it with --to-source). Gate it like the other destructive ops.
                 // (Rollback is refused on append-only archives — see destroy_block.)
-                if let Some(reason) = destroy_block {
-                    anyhow::bail!("Refused: {reason} (snapshot rollback).");
-                }
+                destroy_gate(destroy_block, "snapshot rollback")?;
                 if !i_accept_non_atomic {
                     anyhow::bail!(
                         "snapshot rollback replaces the archive DB file and has a documented \
@@ -2986,10 +3245,7 @@ async fn main() -> Result<()> {
                 // non-destructive: everything the live tree had is recoverable
                 // by rolling forward. (Rollback is still refused on append-only
                 // archives — see the destroy_block gate above.)
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let ts = unix_ts();
                 let pre_name = format!("pre-rollback-{ts}");
                 db.create_snapshot(&pre_name)?;
                 println!("Saved current state as snapshot '{pre_name}'.");
@@ -3020,16 +3276,11 @@ async fn main() -> Result<()> {
                 // Flush our WAL so nothing checkpoints stale pages later, and drop
                 // the WAL/SHM files that belong to the database being replaced.
                 db.wal_checkpoint_truncate()?;
-                if let Ok(f) = std::fs::File::open(&tmp_path) {
-                    let _ = f.sync_all();
-                }
+                fsync_file(std::path::Path::new(&tmp_path));
                 std::fs::rename(&tmp_path, &args.archive)?;
                 // fsync the directory so the rename is durable
-                if let Ok(dir) = std::fs::File::open(&archive_dir) {
-                    let _ = dir.sync_all();
-                }
-                let _ = std::fs::remove_file(format!("{}-wal", args.archive));
-                let _ = std::fs::remove_file(format!("{}-shm", args.archive));
+                fsync_dir(std::path::Path::new(&archive_dir));
+                remove_db_files(&args.archive, false);
 
                 println!("Rolled back to snapshot #{id} ({snap_name}).");
                 println!(
@@ -3050,9 +3301,7 @@ async fn main() -> Result<()> {
                 keep_yearly,
                 checkpoint,
             } => {
-                if let Some(reason) = destroy_block {
-                    anyhow::bail!("Refused: {reason} (snapshot prune deletes history).");
-                }
+                destroy_gate(destroy_block, "snapshot prune deletes history")?;
                 // `Some(0)` is the borg/rsnapshot "rule does
                 // not apply" sentinel (the previous version treated 0 as
                 // "keep zero" → silently wiped every snapshot). Coerce to
@@ -3338,11 +3587,9 @@ async fn main() -> Result<()> {
 
                 // Clean up temp files
                 let _ = std::fs::remove_file(&tmp_from);
-                let _ = std::fs::remove_file(format!("{}-wal", tmp_from));
-                let _ = std::fs::remove_file(format!("{}-shm", tmp_from));
+                remove_db_files(&tmp_from, false);
                 let _ = std::fs::remove_file(&tmp_to);
-                let _ = std::fs::remove_file(format!("{}-wal", tmp_to));
-                let _ = std::fs::remove_file(format!("{}-shm", tmp_to));
+                remove_db_files(&tmp_to, false);
             }
             SnapshotCommands::Export { id, dest } => {
                 require_master_key(&db, &args.priv_key, "snapshot export")?;
@@ -3389,9 +3636,7 @@ async fn main() -> Result<()> {
                 );
             }
             SnapshotCommands::DeleteApply { plan } => {
-                if let Some(reason) = destroy_block {
-                    anyhow::bail!("Refused: {reason} (snapshot delete applies history deletion).");
-                }
+                destroy_gate(destroy_block, "snapshot delete applies history deletion")?;
                 let plan: SnapshotDeletePlan = serde_json::from_slice(&std::fs::read(plan)?)?;
                 if plan.api_version != 1 {
                     anyhow::bail!("unsupported delete-plan version");
@@ -3416,34 +3661,246 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Gc { grace_period_hours } => {
-            if let Some(reason) = destroy_block {
-                anyhow::bail!("Refused: {reason} (gc deletes chunks).");
-            }
+            destroy_gate(destroy_block, "gc deletes chunks")?;
             let start = Instant::now();
             let (total_removed, local_orphans) = engine.gc(*grace_period_hours).await?;
-            let duration = start.elapsed().as_millis();
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            append_log(
+            log_gc_finished(
                 &args.archive,
-                LogEvent::GcFinished {
-                    duration_ms: duration,
-                    total_removed,
-                    local_orphans,
-                    timestamp: ts,
-                },
+                start.elapsed().as_millis(),
+                total_removed,
+                local_orphans,
             );
+        }
+        Commands::SharedGc {
+            dry_run,
+            reclaim_stale_holders_days,
+            drop_holder,
+        } => {
+            destroy_gate(destroy_block, "shared-gc reclaims domain content")?;
+            let domain_id = db.get_config("dedup_shared_domain")?;
+            let Some(domain_id) = domain_id else {
+                println!("{db_path} is not a shared-dedup archive: nothing to reclaim.");
+                return Ok(());
+            };
+            let store_dir = db
+                .get_config("dedup_shared_store_dir")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no store dir"))?;
+            let expected_ns = db
+                .get_config("dedup_shared_namespace")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no namespace"))?;
+            let env_secret = std::env::var("CAIRN_SHARED_DEDUP_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "shared-gc needs the domain secret via CAIRN_SHARED_DEDUP_SECRET"
+                    )
+                })?;
+            let secret: Vec<u8> = {
+                let mut b = env_secret.into_bytes();
+                while matches!(b.last(), Some(b'\n' | b'\r')) {
+                    b.pop();
+                }
+                b
+            };
+            if cairn_store::shared_dedup::derive_namespace(&domain_id, &secret) != expected_ns {
+                anyhow::bail!("CAIRN_SHARED_DEDUP_SECRET does not match this archive's domain");
+            }
+            // Targeted cleanup first: an operator who knows a destroyed
+            // archive's holder id (printed by `status` before it died) can
+            // release exactly its pins — no age heuristic involved.
+            if let Some(hid) = drop_holder {
+                let dropped = cairn_store::shared_dedup::drop_holder_links(
+                    &store_dir,
+                    &expected_ns,
+                    hid,
+                    *dry_run,
+                )?;
+                if *dry_run {
+                    println!(
+                        "shared-gc[{domain_id}] DRY-RUN: would drop {dropped} link(s) of holder {hid}"
+                    );
+                } else {
+                    println!("shared-gc[{domain_id}]: dropped {dropped} link(s) of holder {hid}");
+                }
+            }
+            let report = cairn_store::shared_dedup::reclaim_unheld_records(
+                &store_dir,
+                &expected_ns,
+                &secret,
+                *reclaim_stale_holders_days,
+                *dry_run,
+            )?;
+            if *dry_run {
+                println!(
+                    "shared-gc[{domain_id}] DRY-RUN: scanned {}, held {}, reclaimable {}, \
+                     stale holders would drop {}, legacy/unreadable {}",
+                    report.records_scanned,
+                    report.held,
+                    report.reclaimable,
+                    report.stale_holders_dropped,
+                    report.legacy_records,
+                );
+            } else {
+                println!(
+                    "shared-gc[{domain_id}]: scanned {}, held {}, records reclaimed {}, \
+                     objects reclaimed {}, stale holders dropped {}, race aborts {}, \
+                     legacy/unreadable {}",
+                    report.records_scanned,
+                    report.held,
+                    report.reclaimed_records,
+                    report.reclaimed_objects,
+                    report.stale_holders_dropped,
+                    report.aborted_races,
+                    report.legacy_records,
+                );
+            }
+        }
+        Commands::DestroyShared {
+            i_accept_destroy,
+            dry_run,
+        } => {
+            if !*i_accept_destroy {
+                anyhow::bail!(
+                    "Refused: pass --i-accept-destroy to confirm this archive's \
+                     shared-dedup domain pins will be dropped."
+                );
+            }
+            destroy_gate(destroy_block, "shared-dedup destroy: drops domain pins")?;
+            let domain_id = db.get_config("dedup_shared_domain")?;
+            let Some(domain_id) = domain_id else {
+                println!("{db_path} is not a shared-dedup archive: nothing to destroy.");
+                return Ok(());
+            };
+            let store_dir = db
+                .get_config("dedup_shared_store_dir")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no store dir"))?;
+            let expected_ns = db
+                .get_config("dedup_shared_namespace")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no namespace"))?;
+            let holder_id = db
+                .get_config("dedup_holder_id")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no holder id"))?;
+            let env_secret = std::env::var("CAIRN_SHARED_DEDUP_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "destroy-shared needs the domain secret via CAIRN_SHARED_DEDUP_SECRET"
+                    )
+                })?;
+            let secret: Vec<u8> = {
+                let mut b = env_secret.into_bytes();
+                while matches!(b.last(), Some(b'\n' | b'\r')) {
+                    b.pop();
+                }
+                b
+            };
+            if cairn_store::shared_dedup::derive_namespace(&domain_id, &secret) != expected_ns {
+                anyhow::bail!("CAIRN_SHARED_DEDUP_SECRET does not match this archive's domain");
+            }
+            let dropped = cairn_store::shared_dedup::drop_holder_links(
+                &store_dir,
+                &expected_ns,
+                &holder_id,
+                *dry_run,
+            )?;
+            if *dry_run {
+                println!(
+                    "destroy-shared[{domain_id}] DRY-RUN: would drop {dropped} pin(s) for holder {holder_id}. \
+                     Domain content would become reclaimable. This did NOT delete the \
+                     archive database or chunks."
+                );
+            } else {
+                println!(
+                    "destroy-shared[{domain_id}]: dropped {dropped} pin(s) for holder {holder_id}. \
+                     Domain content may now be reclaimed by shared-gc. This did NOT delete the \
+                     archive database or chunks."
+                );
+            }
+        }
+        Commands::HeartbeatShared { dry_run } => {
+            let domain_id = db.get_config("dedup_shared_domain")?;
+            let Some(domain_id) = domain_id else {
+                println!("{db_path} is not a shared-dedup archive: nothing to heartbeat.");
+                return Ok(());
+            };
+            let store_dir = db
+                .get_config("dedup_shared_store_dir")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no store dir"))?;
+            let expected_ns = db
+                .get_config("dedup_shared_namespace")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no namespace"))?;
+            let holder_id = db
+                .get_config("dedup_holder_id")?
+                .ok_or_else(|| anyhow::anyhow!("shared-dedup archive has no holder id"))?;
+            let env_secret = std::env::var("CAIRN_SHARED_DEDUP_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "heartbeat-shared needs the domain secret via CAIRN_SHARED_DEDUP_SECRET"
+                    )
+                })?;
+            let secret: Vec<u8> = {
+                let mut b = env_secret.into_bytes();
+                while matches!(b.last(), Some(b'\n' | b'\r')) {
+                    b.pop();
+                }
+                b
+            };
+            if cairn_store::shared_dedup::derive_namespace(&domain_id, &secret) != expected_ns {
+                anyhow::bail!("CAIRN_SHARED_DEDUP_SECRET does not match this archive's domain");
+            }
+            let holders_root = std::path::Path::new(&store_dir)
+                .join(format!("dedup/shared/{expected_ns}/holders"));
+            let mut touched = 0u64;
+            if let Ok(rd) = std::fs::read_dir(&holders_root) {
+                for entry in rd.flatten() {
+                    if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let content_id = entry.file_name().to_string_lossy().to_string();
+                    if cairn_store::shared_dedup::validate_storage_component(
+                        &content_id,
+                        "content id",
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    let link = entry.path().join(&holder_id);
+                    if !link.exists() {
+                        continue;
+                    }
+                    if *dry_run {
+                        touched += 1;
+                        continue;
+                    }
+                    cairn_store::shared_dedup::add_shared_holder(
+                        &store_dir,
+                        &expected_ns,
+                        &content_id,
+                        &holder_id,
+                    )?;
+                    touched += 1;
+                }
+            }
+            if *dry_run {
+                println!(
+                    "heartbeat-shared[{domain_id}] DRY-RUN: would refresh {touched} link(s) for holder {holder_id}"
+                );
+            } else {
+                println!(
+                    "heartbeat-shared[{domain_id}]: refreshed {touched} link(s) for holder {holder_id}"
+                );
+            }
         }
         Commands::Scrub { .. } => {
             let start = Instant::now();
             let (verified, corrupted) = engine.scrub().await?;
             let duration = start.elapsed().as_millis();
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let ts = unix_ts();
             append_log(
                 &args.archive,
                 LogEvent::ScrubFinished {
@@ -3762,8 +4219,7 @@ async fn main() -> Result<()> {
             if let Some(tmp_path) = snap_tmp_file {
                 let path_buf = tmp_path.to_path_buf();
                 drop(tmp_path); // auto-deletes the main .tmp file
-                let _ = std::fs::remove_file(format!("{}-wal", path_buf.display()));
-                let _ = std::fs::remove_file(format!("{}-shm", path_buf.display()));
+                remove_db_files(&path_buf.display().to_string(), false);
             }
         }
         Commands::Daemon { action, .. } => {
@@ -3824,7 +4280,9 @@ async fn main() -> Result<()> {
                 // components so a backup cannot create dentries outside the
                 // archive root (round 3 idea #10 / deep audit attack surface).
                 if dest.split('/').any(|p| p == ".." || p == ".") {
-                    anyhow::bail!("Refused: backup destination {dest:?} contains a traversal component");
+                    anyhow::bail!(
+                        "Refused: backup destination {dest:?} contains a traversal component"
+                    );
                 }
                 let parts: Vec<&str> = dest.split('/').filter(|s| !s.is_empty()).collect();
                 for part in parts {
@@ -3974,10 +4432,7 @@ async fn main() -> Result<()> {
                 &args.archive,
                 LogEvent::BackupStarted {
                     snapshot_name: dest.clone(),
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    timestamp: unix_ts(),
                 },
             );
 
@@ -4078,23 +4533,33 @@ async fn main() -> Result<()> {
                     // its content again.
                     let hl_key = (metadata.dev(), metadata.ino());
                     if metadata.nlink() > 1 {
-                        if let Some(&existing) = hardlink_map.get(&hl_key) {
-                            match engine
-                                .link(req.clone(), existing, parent_ino, file_name)
-                                .await
-                            {
-                                Ok(_) => {
-                                    progress.inc(1);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    // Fall through and store a normal copy — never
-                                    // drop the file just because linking failed.
-                                    tracing::warn!(
-                                        "backup: hardlink {:?} failed, storing as copy: {}",
-                                        path,
-                                        e
-                                    );
+                        // Re-verify the source identity before linking: a file
+                        // swapped between walk and processing must not be
+                        // mis-linked to a stale inode (TOCTTOU).
+                        let current_meta = std::fs::metadata(path).ok();
+                        let identity_ok = current_meta
+                            .as_ref()
+                            .map(|m| (m.dev(), m.ino()) == hl_key)
+                            .unwrap_or(false);
+                        if identity_ok {
+                            if let Some(&existing) = hardlink_map.get(&hl_key) {
+                                match engine
+                                    .link(req.clone(), existing, parent_ino, file_name)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        progress.inc(1);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // Fall through and store a normal copy — never
+                                        // drop the file just because linking failed.
+                                        tracing::warn!(
+                                            "backup: hardlink {:?} failed, storing as copy: {}",
+                                            path,
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -4137,7 +4602,7 @@ async fn main() -> Result<()> {
                                 .await
                                 .unwrap_or(Ok(None))
                         } {
-                            // InodeInfo: (mode, uid, gid, size, nlink, mtime_sec, mtime_nsec)
+                            // InodeInfo: (mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, rdev)
                             let archived_size = inode_info.3;
                             let archived_mtime_sec = inode_info.5;
                             let archived_mtime_nsec = inode_info.6;
@@ -4224,14 +4689,17 @@ async fn main() -> Result<()> {
                                 };
                                 // Envelope-wrap before storing: inline data must not
                                 // sit as plaintext in the DB (write-only property).
-                                let recorded = engine
-                                    .wrap_inline(&data)
-                                    .and_then(|wrapped| {
-                                        engine
-                                            .db
-                                            .set_inline_file(inode, &wrapped, data.len() as u64, &digest.hash)
-                                            .map_err(anyhow::Error::from)
-                                    });
+                                let recorded = engine.wrap_inline(&data).and_then(|wrapped| {
+                                    engine
+                                        .db
+                                        .set_inline_file(
+                                            inode,
+                                            &wrapped,
+                                            data.len() as u64,
+                                            &digest.hash,
+                                        )
+                                        .map_err(anyhow::Error::from)
+                                });
                                 if let Err(e) = recorded {
                                     tracing::error!(
                                         "backup: failed to record inline file {:?}: {} — NOT backed up",
@@ -4342,6 +4810,11 @@ async fn main() -> Result<()> {
                                 }
                                 if write_failed {
                                     tracing::error!("backup: {:?} was NOT fully backed up", path);
+                                    // Drop the (possibly-broken) archive inode from the
+                                    // hardlink map so later hardlinks don't link to it.
+                                    if metadata.nlink() > 1 {
+                                        hardlink_map.remove(&hl_key);
+                                    }
                                     backup_failures += 1;
                                     progress.inc(1);
                                     continue;
@@ -4520,10 +4993,7 @@ async fn main() -> Result<()> {
                 LogEvent::BackupFinished {
                     snapshot_name: dest.clone(),
                     duration_ms: start.elapsed().as_millis(),
-                    timestamp: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
+                    timestamp: unix_ts(),
                 },
             );
 
@@ -4556,10 +5026,7 @@ async fn main() -> Result<()> {
 
             // Point-in-time index state (ops completeness / roll-forward), optional.
             if *auto_snapshot {
-                let ts = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let ts = unix_ts();
                 let name = format!("post-backup-{ts}");
                 db.create_snapshot(&name)?;
                 println!("Auto-snapshot created: {name}");

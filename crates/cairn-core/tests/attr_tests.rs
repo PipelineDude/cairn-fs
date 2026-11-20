@@ -502,7 +502,7 @@ fn test_get_config_propagates_db_error() {
 fn test_file_chunks_no_redundant_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = cairn_index::Db::new(dir.path().join("a.db").to_str().unwrap(), None).unwrap();
-    db.insert_inode_with_dentry(0o100644, 1000, 1000, 0, 1, 1, "f", None)
+    db.insert_inode_with_dentry(0o100644, 1000, 1000, 0, 1, 0, 1, "f", None)
         .unwrap();
     let ino = db.get_dentry_inode(1, "f").unwrap().expect("dentry exists");
     db.insert_file_chunk(ino, 0, "obj1", 100, 0).unwrap();
@@ -550,7 +550,7 @@ fn test_set_xattr_with_flags() {
     use cairn_index::{Db, XattrFlag};
     let dir = tempfile::tempdir().unwrap();
     let db = Db::new(dir.path().join("a.db").to_str().unwrap(), None).unwrap();
-    db.insert_inode_with_dentry(0o100644, 1000, 1000, 0, 1, 1, "f", None)
+    db.insert_inode_with_dentry(0o100644, 1000, 1000, 0, 1, 0, 1, "f", None)
         .unwrap();
     let ino = db.get_dentry_inode(1, "f").unwrap().expect("dentry");
     db.set_xattr_with_flags(ino, "user.x", b"v1", XattrFlag::None)
@@ -582,7 +582,7 @@ fn test_set_xattr_with_flags() {
 fn test_truncate_inode_clears_inline_and_chunks() {
     let dir = tempfile::tempdir().unwrap();
     let db = cairn_index::Db::new(dir.path().join("a.db").to_str().unwrap(), None).unwrap();
-    db.insert_inode_with_dentry(0o100644, 1000, 1000, 0, 1, 1, "f", None)
+    db.insert_inode_with_dentry(0o100644, 1000, 1000, 0, 1, 0, 1, "f", None)
         .unwrap();
     let ino = db.get_dentry_inode(1, "f").unwrap().expect("dentry");
     // Plant inline data + chunks.
@@ -783,4 +783,103 @@ fn test_cairn_keys_writes_secret_files_mode_0600() {
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{name} must be owner-only, got {mode:o}");
     }
+}
+
+/// Glob extract must touch only what the pattern selects. Before the glob
+/// filter, symlinks and special files were recreated for EVERY pattern; an
+/// unmatched FIFO (mknod under a directory the glob never created → ENOENT)
+/// then made a fully successful narrow restore exit non-zero via the
+/// failure counter.
+#[tokio::test]
+async fn test_extract_matching_skips_unmatched_specials() {
+    let (engine, dir) = setup_engine().await;
+    let req = Request::default();
+
+    // keep/a.txt is matched; dev/myfifo is NOT.
+    let keep = engine
+        .mkdir(req.clone(), 1, OsStr::new("keep"), 0o755, 0)
+        .await
+        .unwrap();
+    engine
+        .mknod(req.clone(), keep.attr.ino, OsStr::new("a.txt"), 0o100644, 0)
+        .await
+        .unwrap();
+    let dev = engine
+        .mkdir(req.clone(), 1, OsStr::new("dev"), 0o755, 0)
+        .await
+        .unwrap();
+    engine
+        .mknod(
+            req.clone(),
+            dev.attr.ino,
+            OsStr::new("myfifo"),
+            libc::S_IFIFO | 0o644,
+            0,
+        )
+        .await
+        .unwrap();
+
+    let dest = dir.path().join("restore");
+    engine
+        .extract_matching("keep/*.txt", dest.to_str().unwrap(), false)
+        .await
+        .expect("narrow glob must succeed despite the unmatched FIFO");
+    assert!(dest.join("keep/a.txt").exists());
+    assert!(
+        !dest.join("dev").exists(),
+        "unmatched special must not be recreated"
+    );
+}
+
+/// A directory the glob itself selects is restored even when EMPTY
+/// (aligned with extract_all, where directories are materialized eagerly).
+#[tokio::test]
+async fn test_extract_matching_materializes_matched_empty_dir() {
+    let (engine, dir) = setup_engine().await;
+    let req = Request::default();
+    engine
+        .mkdir(req.clone(), 1, OsStr::new("emptyd"), 0o755, 0)
+        .await
+        .unwrap();
+    let dest = dir.path().join("restore");
+    engine
+        .extract_matching("emptyd", dest.to_str().unwrap(), false)
+        .await
+        .unwrap();
+    assert!(dest.join("emptyd").is_dir(), "matched empty dir must exist");
+}
+
+/// An unsafe dentry name anywhere in the tree is a counted failure: the
+/// extract still exits non-zero, but matched entries are restored (the
+/// previous behaviour aborted the whole extract before reaching them).
+#[tokio::test]
+async fn test_extract_matching_counts_unsafe_dentry_without_aborting() {
+    let (engine, dir) = setup_engine().await;
+    let req = Request::default();
+
+    // A regular file that the glob selects.
+    let good = engine
+        .mknod(req.clone(), 1, OsStr::new("good.txt"), 0o100644, 0)
+        .await
+        .unwrap();
+
+    // An unsafe dentry name injected directly into the index (a tampered DB).
+    let bad_ino = engine.db.insert_inode(0o100644, 0, 0, 0, 1).unwrap();
+    engine
+        .db
+        .insert_dentry(1, "../escaped.bin", bad_ino)
+        .unwrap();
+
+    let dest = dir.path().join("restore");
+    let result = engine
+        .extract_matching("*.txt", dest.to_str().unwrap(), false)
+        .await;
+    assert!(
+        result.is_err(),
+        "unsafe dentry must make the extract non-zero"
+    );
+    assert!(
+        dest.join("good.txt").exists(),
+        "matched file must still be restored"
+    );
 }

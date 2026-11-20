@@ -210,7 +210,7 @@ impl Vfs {
             let name = self
                 .engine
                 .resolve_dentry_name(ino, &name_key, name_enc.as_deref());
-            if let Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec)) =
+            if let Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, _rdev)) =
                 self.getattr_raw(entry_ino).await?
             {
                 let kind = crate::types::mode_to_filetype(mode);
@@ -234,7 +234,7 @@ impl Vfs {
     /// Get file/directory metadata by inode.
     pub async fn getattr(&self, ino: u64) -> anyhow::Result<Option<DirEntry>> {
         match self.getattr_raw(ino).await? {
-            Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec)) => {
+            Some((mode, uid, gid, size, nlink, mtime_sec, mtime_nsec, _rdev)) => {
                 let kind = crate::types::mode_to_filetype(mode);
                 Ok(Some(DirEntry {
                     name: String::new(),
@@ -309,7 +309,7 @@ impl Vfs {
                 .await
                 .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
-                if let Some((mode, _, _, _, _, _, _)) = inode_info {
+                if let Some((mode, _, _, _, _, _, _, _)) = inode_info {
                     let file_type = mode & libc::S_IFMT;
                     if file_type == libc::S_IFLNK {
                         let target = self.readlink(current_ino).await?;
@@ -367,7 +367,7 @@ impl Vfs {
     async fn getattr_raw(
         &self,
         ino: u64,
-    ) -> anyhow::Result<Option<(u32, u32, u32, u64, u32, i64, u32)>> {
+    ) -> anyhow::Result<Option<(u32, u32, u32, u64, u32, i64, u32, u64)>> {
         let db = self.engine.db.clone();
         tokio::task::spawn_blocking(move || db.get_inode(ino))
             .await
